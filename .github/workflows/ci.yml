@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/ci.yml"
+
+defaults:
+  run:
+    working-directory: backend
+
+jobs:
+  # ── Lint ──────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dev dependencies
+        run: uv pip install -e ".[dev]" --system
+
+      - name: Ruff lint
+        run: ruff check saras/
+
+      - name: Ruff format check
+        run: ruff format --check saras/
+
+      - name: Mypy type check
+        run: mypy saras/
+
+  # ── Tests ─────────────────────────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: saras_test
+          POSTGRES_USER: saras
+          POSTGRES_PASSWORD: saras
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://saras:saras@localhost:5432/saras_test
+      REDIS_URL: redis://localhost:6379
+      DUCKDB_PATH: ":memory:"
+      ENVIRONMENT: testing
+      # testcontainers will spin up its own containers for isolation
+      # but the service containers above are available as fallback
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv pip install -e ".[dev]" --system
+
+      - name: Run unit tests (no containers needed)
+        run: pytest tests/unit/ -v --cov=saras --cov-report=xml --no-cov-on-fail
+
+      - name: Run integration tests
+        run: pytest tests/integration/ -v --cov=saras --cov-append --cov-report=xml
+
+      - name: Run e2e tests
+        run: pytest tests/e2e/ -v --cov=saras --cov-append --cov-report=xml --cov-fail-under=70
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          files: backend/coverage.xml
+          flags: backend
+        if: always()

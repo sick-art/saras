@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "react-router-v7": {
+      "source": "existential-birds/beagle",
+      "sourceType": "github",
+      "computedHash": "194c9e7306024d5ff9f8c2327754d07675fe816870574faa93986f9bd59a830b"
+    },
+    "shadcn": {
+      "source": "shadcn/ui",
+      "sourceType": "github",
+      "computedHash": "873c67922d80775a9fdf596db7964b579f0408c30ec6e3d11989f6055bbec89f"
+    }
+  }
+}

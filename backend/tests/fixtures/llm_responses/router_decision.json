@@ -1,0 +1,13 @@
+{
+  "interrupt_triggered": null,
+  "interrupt_action": null,
+  "handoff_triggered": null,
+  "handoff_target": null,
+  "handoff_context": null,
+  "active_condition": "Order Inquiry",
+  "active_goal": "Track Order",
+  "sub_agent": null,
+  "unfilled_slots": ["Order Number"],
+  "extracted_slot_values": {},
+  "reasoning": "User is asking about their order status"
+}
