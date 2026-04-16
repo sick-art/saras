@@ -1,48 +1,165 @@
 # Architecture Overview
 
-Saras is a monorepo consisting of three main packages: `frontend/`, `backend/`, and `sdk/`. They communicate over HTTP/WebSocket and share a trio of data stores.
+Saras is a monorepo with two deployable packages — `backend/` (FastAPI + Python) and `frontend/` (React + Vite). They communicate over HTTP/WebSocket/SSE and share three data stores.
 
 ---
 
 ## System Diagram
 
-![overview-system](../assets/diagrams/overview-system.svg)
+```mermaid
+flowchart LR
+    subgraph Client["Browser"]
+        UI[React UI<br/>Chat · Form · Graph · YAML]
+        SIM[Simulator<br/>ConversationPane · LiveGraph]
+        OBS[Traces · Evals · Datasets]
+    end
+
+    subgraph Backend["FastAPI backend"]
+        BLD["/builder/chat (SSE)"]
+        WSS["/simulate (WebSocket)"]
+        REST["REST CRUD<br/>agents · projects · datasets · evals · traces"]
+        CORE[core: compiler · validator · executor]
+        PROV[providers: LiteLLM]
+        TRC[tracing: collector · query]
+        EVAL[evals: runner · judge · metrics]
+    end
+
+    subgraph Stores["Data stores"]
+        PG[(PostgreSQL 16<br/>primary store)]
+        RD[(Redis 7<br/>pub/sub + session)]
+        DK[(DuckDB<br/>analytics)]
+    end
+
+    UI --> BLD
+    UI --> REST
+    SIM --> WSS
+    OBS --> REST
+
+    BLD --> PROV
+    WSS --> CORE
+    REST --> CORE
+    CORE --> PROV
+    CORE --> PG
+    CORE --> RD
+    WSS --> RD
+    TRC --> PG
+    TRC --> DK
+    EVAL --> PG
+    EVAL --> PROV
+```
 
 ---
 
 ## Component Responsibilities
 
-| Component | Package | Responsibility |
-|-----------|---------|----------------|
-| **React Frontend** | `frontend/` | Chat Builder, YAML Editor, Form Builder, Graph View, Simulator pane |
-| **Builder API** | `backend/saras/api/builder.py` | Streaming SSE endpoint; accepts user prompt, emits unified YAML diffs |
-| **Simulator API** | `backend/saras/api/simulator.py` | WebSocket session; Redis pub/sub fan-out for real-time span events |
-| **YAML Compiler** | `backend/saras/core/compiler.py` | Parses agent YAML → `CompiledAgent`; builds system prompt + tool definitions |
-| **Validator** | `backend/saras/core/validator.py` | Runs 5 ERROR / 5 WARNING / 2 INFO rules before any execution |
-| **Executor** | `backend/saras/core/executor.py` | Assembles context layers, runs tool loop, persists Run/Span to Postgres |
-| **Router** | `backend/saras/core/executor.py` | `RouterDecision`, slot fill, goal selection |
-| **LiteLLM Adapter** | `backend/saras/providers/litellm.py` | Unified chat/stream completion; provider key routing; tenacity retries |
-| **PostgreSQL** | Docker Compose | Primary store — Projects, Agents, AgentVersions, Runs, Spans, Datasets |
-| **Redis** | Docker Compose | Real-time span event pub/sub; simulator session history |
-| **DuckDB** | Embedded | Embedded analytics on top of Postgres data; powers trace explorer queries |
-| **saras-sdk** | `sdk/` | `pip install saras-sdk`; decorators + HTTP ingest for external code |
+| Component | Location | Responsibility |
+|-----------|----------|----------------|
+| **React Frontend** | [frontend/](../../frontend/) | Chat Builder, YAML editor, Outline + Form, Graph view, Simulator, Traces, Evals |
+| **Builder API** | [backend/saras/api/builder.py](../../backend/saras/api/builder.py) | SSE endpoint that streams explanation deltas + full updated YAML |
+| **Simulator API** | [backend/saras/api/simulator.py](../../backend/saras/api/simulator.py) | WebSocket session, Redis pub/sub fan-out for span events |
+| **Agents API** | [backend/saras/api/agents.py](../../backend/saras/api/agents.py) | CRUD for agents + versions; stores `yaml_content` as source of truth |
+| **Traces API** | [backend/saras/api/traces.py](../../backend/saras/api/traces.py) | Runs, sessions, spans, DuckDB analytics |
+| **Evals API** | [backend/saras/api/evals.py](../../backend/saras/api/evals.py) | Suites, runs, per-item results, SSE progress stream |
+| **Datasets API** | [backend/saras/api/datasets.py](../../backend/saras/api/datasets.py) | Datasets + items; powers eval inputs and review queue |
+| **Samples API** | [backend/saras/api/samples.py](../../backend/saras/api/samples.py) | Pre-made agents + one-click clone |
+| **Compiler** | [backend/saras/core/compiler.py](../../backend/saras/core/compiler.py) | YAML → `CompiledAgent` (system prompt, tool defs, routing context, context layers) |
+| **Validator** | [backend/saras/core/validator.py](../../backend/saras/core/validator.py) | 6 ERROR + 5 WARNING + 2 INFO structural checks |
+| **Executor** | [backend/saras/core/executor.py](../../backend/saras/core/executor.py) | Router → slot fill → primary LLM → tool loop; persists Run/Span; emits span events |
+| **LiteLLM Adapter** | [backend/saras/providers/litellm.py](../../backend/saras/providers/litellm.py) | Unified chat + stream completion, token counting, cost estimation |
+| **Tracing Collector** | [backend/saras/tracing/collector.py](../../backend/saras/tracing/collector.py) | Syncs completed Runs from Postgres into DuckDB for analytics |
+| **Evals Engine** | [backend/saras/evals/](../../backend/saras/evals/) | Deterministic metrics, LLM judge, preset registry, async runner |
+| **PostgreSQL** | Docker Compose | Projects, Agents, AgentVersions, Runs, Spans, Datasets, EvalSuites, EvalRuns, EvalResults, ReviewQueue |
+| **Redis** | Docker Compose | Simulator span pub/sub (`spans:{run_id}`), session state, eval progress channels |
+| **DuckDB** | Embedded (volume) | Analytics roll-ups on top of Postgres span data |
 
 ---
 
 ## Request Flow — Chat Builder
 
-![overview-request-flow](../assets/diagrams/overview-request-flow.svg)
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant FE as Builder UI
+    participant SSE as /builder/chat (SSE)
+    participant LLM as LiteLLM (builder model)
+    participant DB as Postgres
+
+    U->>FE: "Add a refund goal"
+    FE->>SSE: POST { message, yaml_content }
+    SSE->>LLM: stream_completion(system=BUILDER_SYSTEM, user=instruction+yaml)
+    loop token stream
+        LLM-->>SSE: delta
+        SSE-->>FE: { type: "delta", text }
+    end
+    SSE->>SSE: parse JSON, diff vs original
+    SSE-->>FE: { type: "yaml_diff", diff }
+    SSE-->>FE: { type: "updated_yaml", yaml }
+    SSE-->>FE: { type: "done" }
+    FE->>DB: PATCH /agents/:id { yaml_content }
+```
+
+---
+
+## Request Flow — Simulator
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant SIM as Simulator UI
+    participant WS as /simulate (WS)
+    participant EX as executor.run_turn
+    participant R as Redis (spans:run_id)
+    participant PG as Postgres
+
+    U->>SIM: send message
+    SIM->>WS: { type: "user_message", content }
+    WS->>PG: pre-allocate Run row
+    WS->>EX: run_turn(compiled, history, msg)
+    par span fan-out
+        EX->>R: publish router_start/router_decision
+        EX->>R: publish llm_call_start/end
+        EX->>R: publish tool_call/tool_result
+        EX->>R: publish turn_complete
+        R-->>WS: subscribe → relay
+        WS-->>SIM: { type: "span", ... }
+    and final
+        EX-->>WS: TurnResult(content, tokens, cost)
+        WS-->>SIM: { type: "agent_message", content }
+        WS-->>SIM: { type: "turn_end", tokens, cost_usd }
+    end
+```
 
 ---
 
 ## Data Model (simplified)
 
-![overview-data-model](../assets/diagrams/overview-data-model.svg)
+```mermaid
+erDiagram
+    Project ||--o{ Agent : has
+    Project ||--o{ Dataset : has
+    Project ||--o{ EvalSuite : has
+    Agent ||--o{ AgentVersion : versions
+    Agent ||--o{ Run : executes
+    Run ||--o{ Span : emits
+    Dataset ||--o{ DatasetItem : contains
+    EvalSuite ||--o{ EvalRun : triggers
+    EvalRun ||--o{ EvalResult : produces
+    Run ||--o{ ReviewQueueItem : "feeds back"
+```
+
+Keys worth noting:
+
+- `Agent.yaml_content` is the source of truth. `compiled_config` is a cached JSON dump of `CompiledAgent` for fast reads.
+- `Run.session_id` groups multiple turns into a conversation session.
+- `Span.type` discriminates event kinds: `router_start`, `router_decision`, `llm_call_start`, `llm_call_end`, `tool_call`, `tool_result`, `tool_error`, `slot_fill`, `interrupt_triggered`, `handoff_triggered`, `turn_complete`.
 
 ---
 
 ## Next Steps
 
-- [Agent Schema](agent-schema.md) — deep-dive into the YAML format
+- [Agent Schema](agent-schema.md) — the YAML format in detail
 - [Compiler](compiler.md) — how YAML becomes a runnable agent
 - [Executor](executor.md) — the tool loop and span lifecycle
+- [Multi-Agent](multi-agent.md) — sub-agent delegation

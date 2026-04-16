@@ -1,42 +1,63 @@
 # Saras
 
-**Saras** is a self-hosted, open-source platform for the full agent lifecycle — from building and simulating agents to deploying, observing, evaluating, and improving them.
+**Saras** is a self-hosted, open-source platform for building conversational agents — fast, without a heavy engineering team, and without orchestration becoming the blocker.
 
 ---
 
 ## The Problem
 
-No single tool covers the complete agent lifecycle today.
+Building a production-grade conversational agent today usually means stitching together routing logic, tool calling, context management, eval harnesses, and tracing — before you've even written a single conversational flow. For teams without a dedicated AI infra crew, the orchestration plumbing becomes the project, and the actual agent behaviour gets squeezed.
 
-| Tool | Build | Simulate | Observe | Evaluate | Improve |
-|------|-------|----------|---------|----------|---------|
-| LangSmith | — | — | Partial | Partial | — |
-| Phoenix | — | — | Yes | Partial | — |
-| Braintrust | — | — | — | Yes | — |
-| **Saras** | **Yes** | **Yes** | **Yes** | **Yes** | **Yes** |
+Saras flips that. The hard parts — routing between conditions, layering context, slot filling, handoffs, tool retries — are handled by the platform. Teams focus on what actually shapes the agent's quality:
 
-Saras unifies these with a first-class YAML-based agent builder that abstracts orchestration and context engineering from users.
+- **Writing conversational flows and rules** in plain English
+- **Simulating** them against realistic user turns
+- **Evaluating** them with metric suites and LLM judges
+- **Iterating** until the agent is robust
+
+---
+
+## How Saras Compares
+
+A few tools sit in adjacent territory. Each makes different trade-offs:
+
+| Tool | Strengths | Trade-off vs. Saras |
+|------|-----------|---------------------|
+| **OpenAI AgentKit** | First-party tool integrations, voice, vision, hosted infra | Vendor-locked to OpenAI models; less control over routing and context |
+| **n8n** | Massive connector library, generic workflow automation | Workflow-first, not conversation-first; no built-in agent eval loop |
+| **Replit Agents** | Instant prototyping, code generation focus | Aimed at building software, not running customer-facing conversational agents |
+| **Saras** | YAML-first conversational agent definition, built-in simulate + observe + evaluate, self-hosted | **Text-only today** — voice and richer modalities are on the roadmap, not in the box |
+
+Saras is intentionally narrow: text-based conversational agents, end-to-end, owned by your team. Voice agents and a broader connector catalogue are future scope.
 
 ---
 
 ## Lifecycle
 
-![lifecycle](assets/diagrams/lifecycle.svg)
+```mermaid
+flowchart LR
+    BUILD[Build<br/>YAML schema · Chat / Outline / Graph / Editor] --> SIM[Simulate<br/>WebSocket session · live span graph]
+    SIM --> DEPLOY[Deploy<br/>Docker Compose · executor]
+    DEPLOY --> OBS[Observe<br/>Runs · sessions · DuckDB analytics]
+    OBS --> EVAL[Evaluate<br/>Metric sets · LLM judge · review queue]
+    EVAL --> BUILD
+```
 
 | Phase | What happens |
 |-------|-------------|
-| **Build** | Define agents in YAML — persona, tools, goals, conditions, handoffs |
-| **Simulate** | Run conversations against your agent in a sandboxed WebSocket session |
+| **Build** | Define agents in YAML — persona, tools, conditions, goals, sequences, handoffs |
+| **Simulate** | Drive the agent over a WebSocket; watch every span land in real time |
 | **Deploy** | Ship via Docker Compose; route traffic through the executor |
-| **Observe** | Ingest spans and traces; explore in the DuckDB-backed trace UI |
-| **Evaluate** | Run metric sets and LLM-as-judge against trace data |
-| **Improve** | Feed golden datasets back into the builder; close the loop |
+| **Observe** | Persist runs and spans to Postgres; aggregate to DuckDB; explore in the Traces UI |
+| **Evaluate** | Run preset or custom metric suites against trace data and golden datasets |
+| **Improve** | Promote review-queue items into datasets; feed back into the builder |
 
 ---
 
 ## Quick Links
 
-- [Why Saras?](why-saras.md) — The design rationale and what makes Saras different
+- [Getting Started](getting-started.md) — Clone, configure, build your first agent, simulate, and evaluate
 - [Architecture Overview](architecture/overview.md) — System diagram and component map
+- [Agent Schema](architecture/agent-schema.md) — The YAML format with an annotated example
 - [Self-Hosting](self-hosting.md) — Get running in minutes with Docker Compose
-- [SDK](sdk.md) — Instrument your own code with `saras-sdk`
+- [SDK](sdk.md) — Planned interface for instrumenting external code

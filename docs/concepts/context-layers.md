@@ -1,75 +1,85 @@
 # Context Layers
 
-Saras uses **progressive context disclosure** — instead of injecting the full agent definition into every LLM call, context is assembled in 8 layers, with each layer added only when relevant. This reduces token usage and keeps the model focused.
+Saras uses **progressive context disclosure**. Instead of stuffing the full agent definition into every LLM call, context is pre-split into 8 layers and the executor only injects the ones relevant to the current turn.
+
+This keeps tokens down, keeps the model focused, and lets agents scale to many goals without paying for all of them on every message.
 
 ---
 
 ## The 8 Layers
 
-![context-layers](../assets/diagrams/context-layers.svg)
+| # | Label | Always injected? | Built at | Content |
+|---|-------|------------------|----------|---------|
+| 1 | `base` | **Yes** | Compile time | `persona` + `tone` + `global_rules` + `out_of_scope` + list of `interrupt_triggers` (names + first sentence) |
+| 2 | `condition:<Name>` | Only the active one | Compile time | Active condition name + full description |
+| 3 | `goal:<Condition>:<Goal>` | Only the active one | Compile time | Active goal description + optional `tone` override |
+| 4 | (slot fill) | Runtime short-circuit | Runtime | Injected as a direct `ask_if_missing` question — never reaches the primary LLM |
+| 5 | `sequence:<Condition>:<Goal>:<Seq>` | All sequences for the active goal | Compile time | Numbered steps, including `@tool:` references |
+| 6 | `goal_rules_tools:<Condition>:<Goal>` | Only for the active goal | Compile time | Goal-scoped rules + descriptions of allowed tools |
+| 7 | tool results | Inline during tool loop | Runtime | Tool output is appended to the message array as `role=tool` entries |
+| 8 | memory | Reserved | Runtime | Future: cross-turn retrieved memory |
 
-| Layer | Always injected? | Content |
-|-------|-----------------|---------|
-| **1. Base Persona** | Yes | `persona` + global `tone` |
-| **2. Global Rules** | Yes | `global_rules` list |
-| **3. Out-of-Scope** | Yes | `out_of_scope` list |
-| **4. Interrupt Triggers** | Yes | `interrupt_triggers` — highest priority |
-| **5. Active Goal** | Only when a goal is active | Full goal sequences, rules, and tool references |
-| **6. Slot State** | Only when slots are in progress | Which slots are filled, which are pending |
-| **7. Conversation Summary** | Only when history > threshold | LLM-generated rolling summary of earlier turns |
-| **8. Recent History** | Yes (last N turns) | Verbatim last N messages |
+Layers 1–6 are produced up front by [compiler.py](../../backend/saras/core/compiler.py) → `_build_context_layers`. Layers 7 and 8 are purely runtime.
+
+---
+
+## Assembly Per Turn
+
+The executor's `_assemble_system_prompt(compiled, decision)` picks layers by label based on the `RouterDecision`:
+
+```mermaid
+flowchart TD
+    START([run_turn]) --> R1[Layer 1 · base · always]
+    R1 --> MODE{decision type}
+    MODE -->|interrupt| IE[Append EMERGENCY OVERRIDE block<br/>skip goal layers]
+    MODE -->|handoff| HE[Append HANDOFF block<br/>skip goal layers]
+    MODE -->|goal| L2[Layer 2 · active condition]
+    L2 --> L3[Layer 3 · active goal]
+    L3 --> L5[Layer 5 · all sequences for the goal]
+    L5 --> L6[Layer 6 · goal rules + scoped tools]
+    IE --> CALL
+    HE --> CALL
+    L6 --> CALL[chat_completion with messages + scoped tools]
+    CALL --> TL{tool_calls?}
+    TL -->|yes| TOOL[Execute → append Layer 7 · tool results]
+    TOOL --> CALL
+    TL -->|no| DONE
+```
+
+Two branches skip goal layers entirely:
+
+- **Interrupt** — Layer 1 + `EMERGENCY OVERRIDE — <trigger.name>: <trigger.action>`.
+- **Handoff** — Layer 1 + `HANDOFF REQUIRED — transfer this conversation to: <target>. Pass this context: <context_to_pass>`.
+
+Slot fill (Layer 4) never reaches the primary model at all — the executor short-circuits with the slot's `ask_if_missing` prompt directly.
 
 ---
 
 ## Why Not Inject Everything?
 
-Consider an agent with 12 goals, each with 5-step sequences and 3 slots. Injecting all of this on every turn would:
+Consider an agent with 12 conditions, each with 2 goals, each with 2 sequences of 5 steps, and 5 tools. Naive prompt stuffing would feed **every** goal's sequences and every tool's recovery guidance on every turn — mostly irrelevant to the message being handled.
 
-- Waste tokens on irrelevant goals
-- Dilute model attention on the active task
-- Increase latency and cost linearly with agent complexity
+Progressive layers mean:
 
-With progressive context, layers 5 and 6 (the most verbose) are only present when the model actually needs them.
+- Only the active goal's sequences are in-context (typically 1 goal out of N).
+- Only tools usable in the active goal appear in the `tools=...` parameter to the LLM.
+- `on_failure` / `on_empty_result` guidance lives on the tool definition description rather than in the system prompt, so the model only sees it when it's about to call that tool.
 
----
-
-## Layer Assembly (Runtime)
-
-The executor assembles layers per turn in `executor.py`:
-
-```python
-context = []
-context.append(build_base_persona(compiled_agent))      # always
-context.append(build_global_rules(compiled_agent))       # always
-context.append(build_out_of_scope(compiled_agent))       # always
-context.append(build_interrupt_triggers(compiled_agent)) # always
-
-if routing.active_goal:
-    context.append(build_goal_context(routing.active_goal))  # layer 5
-    if routing.active_goal.has_slots:
-        context.append(build_slot_state(routing.slot_state)) # layer 6
-
-if len(history) > SUMMARY_THRESHOLD:
-    context.append(build_summary(history))  # layer 7
-
-context.append(build_recent_history(history, n=RECENT_TURNS))  # always
-```
+The cost saving is quadratic in agent complexity.
 
 ---
 
-## Tuning
+## Implementation Notes
 
-You can adjust the thresholds in `backend/saras/config.py`:
-
-| Setting | Default | Effect |
-|---------|---------|--------|
-| `CONTEXT_SUMMARY_THRESHOLD` | 20 turns | When to start summarizing history |
-| `CONTEXT_RECENT_TURNS` | 6 | How many turns to include verbatim |
+- Labels are deterministic and stable (`f"goal:{cond.name}:{goal.name}"`). The executor looks them up by label — it never re-parses YAML.
+- `always_inject=True` is set on Layer 1 only; every other layer is conditional.
+- Layer 1 is also exposed as `CompiledAgent.base_system_prompt` for callers that want just the base prompt (e.g. debugging, prompt previews in the builder).
 
 ---
 
 ## Related
 
-- [Executor](../architecture/executor.md) — where layers are assembled at runtime
+- [Compiler](../architecture/compiler.md) — where layers 1–6 are built
+- [Executor](../architecture/executor.md) — where layers are selected and assembled each turn
 - [Agent Schema](../architecture/agent-schema.md) — the fields each layer draws from
-- [Routing](routing.md) — how the active goal is determined
+- [Routing](routing.md) — how the active condition/goal is chosen

@@ -1,28 +1,28 @@
 # SDK
 
-The `saras-sdk` Python package lets you instrument your own code and send spans to Saras from outside the platform — useful when you have existing LLM pipelines or scripts you want to observe and evaluate alongside your Saras-built agents.
+The `saras-sdk` Python package will let you instrument your own code and ingest spans into Saras alongside agents you build in the platform.
 
-!!! note "Coming in Phase 7"
-    The SDK is planned for Phase 7 of the Saras roadmap. This page documents the intended interface.
+!!! note "Planned — not yet shipped"
+    The SDK package is on the roadmap and not part of the current backend. This page documents the intended interface so the API surface is reviewable in advance. Until the SDK lands, use the platform-built executor and the trace API directly.
 
 ---
 
-## Installation
+## Intended Interface
+
+### Installation
 
 ```bash
 pip install saras-sdk
 ```
 
----
-
-## Configuration
+### Configuration
 
 ```python
 import saras
 
 saras.configure(
-    api_url="http://localhost:8000",   # your Saras backend
-    api_key="your-api-key",            # from Settings → API Keys
+    api_url="http://localhost:8000",
+    api_key="your-api-key",          # value of SARAS_API_KEY in your backend .env
     project_id="my-project",
 )
 ```
@@ -35,38 +35,21 @@ SARAS_API_KEY=your-api-key
 SARAS_PROJECT_ID=my-project
 ```
 
----
-
-## Decorators
-
-### `@saras.trace`
-
-Wraps a function as a traced span:
+### Decorators
 
 ```python
 @saras.trace(name="generate_response")
 def generate_response(prompt: str) -> str:
-    response = openai.chat.completions.create(...)
-    return response.choices[0].message.content
+    ...
+
+@saras.tool(name="Order Lookup")
+def order_lookup(order_id: str) -> dict:
+    ...
 ```
 
-Every call to `generate_response` will emit a span to Saras with inputs, outputs, and latency.
+Each call emits a span carrying inputs, outputs, latency, and any tokens/cost the wrapped code reports.
 
-### `@saras.tool`
-
-Marks a function as a tool call span:
-
-```python
-@saras.tool(name="Look Up Order")
-def look_up_order(order_id: str) -> dict:
-    return db.query("SELECT * FROM orders WHERE id = ?", order_id)
-```
-
----
-
-## Manual Spans
-
-For more control, use the context manager API:
+### Manual spans
 
 ```python
 with saras.span(name="custom_step", run_id=run_id) as span:
@@ -77,35 +60,18 @@ with saras.span(name="custom_step", run_id=run_id) as span:
 
 ---
 
-## HTTP Ingest
+## Until the SDK Lands
 
-If you prefer not to use the Python SDK, you can POST spans directly to the ingest endpoint:
+If you need to ship spans from outside the platform today, you can:
 
-```http
-POST /api/ingest/spans
-Authorization: Bearer your-api-key
-Content-Type: application/json
-
-{
-  "run_id": "run_abc123",
-  "project_id": "my-project",
-  "spans": [
-    {
-      "span_id": "span_001",
-      "name": "generate_response",
-      "type": "llm",
-      "inputs": {"prompt": "..."},
-      "output": "...",
-      "latency_ms": 1240,
-      "timestamp": "2026-04-14T10:00:00Z"
-    }
-  ]
-}
-```
+- Use the platform's WebSocket simulator endpoint as a reference for the span shapes the UI understands. See [backend/saras/api/simulator.py](../backend/saras/api/simulator.py) and [backend/saras/core/executor.py](../backend/saras/core/executor.py).
+- Read [backend/saras/db/models.py](../backend/saras/db/models.py) for the `Run` and `Span` schemas and write directly to Postgres via Alembic-managed tables (use the same shape the executor uses).
+- Watch the [changelog](changelog.md) for the SDK release.
 
 ---
 
 ## Related
 
 - [Self-Hosting](self-hosting.md) — get a Saras instance running to ingest into
-- [Architecture Overview](architecture/overview.md) — where SDK spans fit in the system
+- [Architecture Overview](architecture/overview.md) — where SDK spans will fit in the system
+- [Executor](architecture/executor.md) — the canonical span shapes Saras emits today
