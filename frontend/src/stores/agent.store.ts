@@ -73,6 +73,10 @@ export interface AgentStoreState {
 
   // Active builder tab
   activeTab: "chat" | "form" | "graph" | "yaml"
+
+  // Currently selected node path in the Form tab outline tree.
+  // "" = agent root; "tools[0]" = first tool; "conditions[0].goals[1].slots[0]" = nested.
+  selectedFormPath: string
 }
 
 export interface AgentStoreActions {
@@ -100,6 +104,9 @@ export interface AgentStoreActions {
   /** Switch active builder tab. */
   setActiveTab: (tab: AgentStoreState["activeTab"]) => void
 
+  /** Set the selected node path in the Form tab outline tree. */
+  setSelectedFormPath: (path: string) => void
+
   /** Reset to initial state. */
   reset: () => void
 }
@@ -120,6 +127,7 @@ const INITIAL_STATE: AgentStoreState = {
   isSaving: false,
   savedYaml: "",
   activeTab: "chat",
+  selectedFormPath: "",
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -239,6 +247,8 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   },
 
   setActiveTab: (tab) => set({ activeTab: tab }),
+
+  setSelectedFormPath: (path) => set({ selectedFormPath: path }),
 
   reset: () => set(INITIAL_STATE),
 }))

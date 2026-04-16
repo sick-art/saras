@@ -5,18 +5,18 @@
  * Tab switcher in header uses shadcn Tabs (line variant).
  */
 
-import { useEffect } from "react"
-import { useParams, Link } from "react-router-dom"
-import { MessageSquare, LayoutGrid, GitBranch, FileCode2, Play, ChevronLeft, Loader2 } from "lucide-react"
-import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@/components/ui/resizable"
 import { useAgentStore } from "@/stores/agent.store"
+import { ChevronLeft, FileCode2, GitBranch, LayoutGrid, Loader2, MessageSquare, Play } from "lucide-react"
+import { useEffect } from "react"
+import { Link, useParams } from "react-router-dom"
 import { ChatBuilder } from "./ChatBuilder"
-import { YAMLEditor } from "./YAMLEditor"
 import { FormBuilder } from "./FormBuilder"
 import { GraphBuilder } from "./GraphBuilder"
+import { YAMLEditor } from "./YAMLEditor"
 
 type Tab = "chat" | "form" | "graph" | "yaml"
 
@@ -99,13 +99,13 @@ export function BuilderLayout() {
         ) : (
           <ResizablePanelGroup orientation="horizontal" className="h-full">
             {/* Primary pane */}
-            <ResizablePanel defaultSize="60%" minSize="30%">
+            <ResizablePanel defaultSize="30%" minSize="30%">
               <TabContent activeTab={activeTab as Tab} projectId={projectId} agentId={agentId} />
             </ResizablePanel>
 
             {/* YAML side panel */}
             <ResizableHandle withHandle />
-            <ResizablePanel defaultSize="40%" minSize="20%" className="hidden lg:flex flex-col">
+            <ResizablePanel defaultSize="70%" minSize="50%" className="hidden lg:flex flex-col">
               <div className="flex items-center gap-2 border-b border-border px-3 py-2 shrink-0">
                 <FileCode2 className="size-3.5 text-muted-foreground" />
                 <span className="text-xs text-muted-foreground font-medium">Live YAML</span>

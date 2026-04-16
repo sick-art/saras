@@ -11,6 +11,8 @@ import {
   fmt_cost,
   fmt_ms,
   SpanRow,
+  ToolChips,
+  toolCountsFromSpans,
 } from "@/components/traces/SpanWaterfall"
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -23,6 +25,7 @@ import {
   GitBranch,
   Hash,
   Layers,
+  Wrench,
 } from "lucide-react"
 import { useEffect, useState } from "react"
 import { Link, useParams } from "react-router-dom"
@@ -36,22 +39,14 @@ function fmt_duration(started: string, ended: string | null): string {
 
 // ── Status badge ───────────────────────────────────────────────────────────────
 
-const STATUS_CLASS: Record<RunStatus, string> = {
-  running:   "bg-blue-500/10 text-blue-500 border-blue-500/20",
-  completed: "bg-emerald-500/10 text-emerald-600 border-emerald-500/20",
-  failed:    "bg-red-500/10 text-red-500 border-red-500/20",
-}
-
 function StatusDot({ status }: { status: RunStatus }) {
   const color =
     status === "completed" ? "bg-emerald-500" :
     status === "failed"    ? "bg-red-500" :
+    status === "cancelled" ? "bg-muted-foreground" :
                              "bg-blue-500 animate-pulse"
   return (
-    <span className={cn(
-      "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium capitalize",
-      STATUS_CLASS[status] ?? "bg-muted text-muted-foreground border-border"
-    )}>
+    <span className="inline-flex items-center gap-1.5 text-xs font-medium capitalize text-muted-foreground">
       <span className={cn("size-1.5 rounded-full shrink-0", color)} />
       {status}
     </span>
@@ -193,6 +188,15 @@ export function TraceDetail() {
                 {run.ended_at && <span>Ended {new Date(run.ended_at).toLocaleString()}</span>}
                 {run.session_id && <span>Session {run.session_id}</span>}
               </div>
+              {(() => {
+                const toolCounts = toolCountsFromSpans(run.spans)
+                return Object.keys(toolCounts).length > 0 ? (
+                  <div className="mt-2 flex items-center gap-2">
+                    <Wrench className="size-3 text-muted-foreground/50 shrink-0" />
+                    <ToolChips toolCounts={toolCounts} />
+                  </div>
+                ) : null
+              })()}
             </div>
 
             {/* ── Waterfall table ───────────────────────────────────────────── */}
@@ -223,6 +227,7 @@ export function TraceDetail() {
                         runDurationMs={runDurationMs}
                         expanded={expanded.has(span.id)}
                         onToggle={() => toggle(span.id)}
+                        allSpans={sortedSpans}
                       />
                     </div>
                   ))}

@@ -37,10 +37,11 @@ Sub-agent delegation:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -48,7 +49,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import new as ulid_new
 
-from saras.core.schema import CompiledAgent, ContextLayer
+from saras.core.schema import AgentTool, CompiledAgent, ContextLayer
 from saras.db.models import Run, Span
 from saras.db.redis import publish
 from saras.providers.litellm import (
@@ -62,6 +63,10 @@ log = structlog.get_logger()
 
 # Maximum tool-call iterations per primary model call before stopping
 MAX_TOOL_ITERATIONS = 5
+
+# Sampling temperature for the primary model. Low but non-zero so the model has
+# a little room to rephrase while still following rules deterministically.
+PRIMARY_TEMPERATURE = 0.3
 
 
 # ── Decision models ────────────────────────────────────────────────────────────
@@ -139,38 +144,6 @@ Rules:
 - NEVER invent condition or goal names — use exact names from the configuration.
 - Return only valid JSON, nothing else.
 """
-
-_ROUTER_SYSTEM_BAD = """\
-You are a routing assistant. Given the agent's configuration and the current conversation,
-your job is to analyse the situation and return a JSON routing decision.
-
-You must return ONLY a JSON object with these fields:
-{
-  "interrupt_triggered": "<trigger name or null>",
-  "interrupt_action": "<action description or null>",
-  "handoff_triggered": "<handoff name or null>",
-  "handoff_target": "<target name or null>",
-  "handoff_context": "<what context to pass or null>",
-  "active_condition": "<condition name or null>",
-  "active_goal": "<goal name or null>",
-  "sub_agent": "<sub-agent name or null>",
-  "unfilled_slots": ["<slot name>", ...],
-  "extracted_slot_values": {"<slot name>": "<extracted value>"},
-  "reasoning": "<one sentence about your decision>"
-}
-
-Rules:
-- Check interrupt triggers FIRST. If one fires, set interrupt_triggered and stop.
-- Check handoffs SECOND. If one fires, set handoff_triggered and stop.
-- Then pick the single most relevant condition + goal for the user's message.
-- For slot extraction: only extract slot values that are explicitly and clearly stated in the LATEST user message.
-  Do not infer from context or earlier conversation turns. If in any doubt, leave the slot as unfilled.
-- In unfilled_slots, include any required slot you are not 100% certain about, even if it was mentioned before.
-- If no condition applies, set both to null.
-- NEVER invent condition or goal names — use exact names from the configuration.
-- Return only valid JSON, nothing else.
-"""
-
 
 def _build_router_prompt(
     compiled: CompiledAgent,
@@ -330,20 +303,198 @@ def _assemble_system_prompt(compiled: CompiledAgent, decision: RouterDecision) -
 
 async def _execute_tool(tool_name: str, arguments: dict, compiled: CompiledAgent) -> str:
     """
-    Execute a tool call. Phase 2: returns a mock response.
+    Execute a tool call. Phase 2: deterministic, realistic mock payload generated
+    by Python (faker + heuristics).
     Phase 3: will route to the tool's endpoint via HTTP.
     """
     tool = next((t for t in compiled.schema_.tools if _snake(t.name) == tool_name), None)
     if tool is None:
         return json.dumps({"error": f"Tool '{tool_name}' not found in agent definition"})
 
-    # Phase 2: mock response — return a placeholder so the model can continue
     log.info("executor.tool_mock", tool=tool_name, args=arguments)
-    return json.dumps({
-        "status": "mock",
-        "message": f"[Phase 2 mock] Tool '{tool.name}' called with: {arguments}",
-        "result": None,
-    })
+    payload = _mock_tool_payload(tool, arguments)
+    return json.dumps(payload, default=str)
+
+
+def _mock_tool_payload(tool: AgentTool, arguments: dict) -> dict:
+    """
+    Build a realistic mock response for a tool call. Deterministic for a given
+    (tool name, arguments) pair so repeated calls return the same payload.
+
+    Shape depends on tool type:
+      - LookupTool  → record-shaped object inferred from tool/input names
+      - KnowledgeTool → results[] with title/snippet/source/score
+      - ActionTool  → success envelope with a generated confirmation id
+    """
+    from faker import Faker
+
+    seed = f"{tool.name}|{json.dumps(arguments, sort_keys=True, default=str)}"
+    fake = Faker()
+    Faker.seed(abs(hash(seed)) % (2**31))
+
+    if tool.type == "KnowledgeTool":
+        return _mock_knowledge_results(tool, arguments, fake)
+    if tool.type == "ActionTool":
+        return _mock_action_result(tool, arguments, fake)
+    return _mock_lookup_record(tool, arguments, fake)
+
+
+def _mock_lookup_record(tool: AgentTool, arguments: dict, fake) -> dict:
+    """Build a realistic record payload for a LookupTool based on keyword
+    heuristics over the tool name and input names."""
+    name_lc = tool.name.lower()
+    record: dict = {"found": True}
+
+    # Echo all provided arguments under their original keys so the model can
+    # reason about what was looked up.
+    for key, value in arguments.items():
+        record[key] = value
+
+    if "order" in name_lc:
+        record.update({
+            "order_number": arguments.get("order_number")
+                or arguments.get("order_id")
+                or f"ORD-{fake.random_int(10000, 99999)}",
+            "status": fake.random_element([
+                "processing", "shipped", "out_for_delivery", "delivered", "returned"
+            ]),
+            "placed_at": fake.date_time_between(start_date="-30d").isoformat(),
+            "estimated_delivery": fake.date_between(start_date="+1d", end_date="+7d").isoformat(),
+            "tracking_number": f"1Z{fake.bothify('??#########').upper()}",
+            "carrier": fake.random_element(["UPS", "FedEx", "USPS", "DHL"]),
+            "customer": {
+                "name": fake.name(),
+                "email": arguments.get("customer_email") or fake.email(),
+            },
+            "items": [
+                {
+                    "sku": f"SKU-{fake.random_int(1000, 9999)}",
+                    "name": fake.catch_phrase(),
+                    "quantity": fake.random_int(1, 3),
+                    "price": round(fake.pyfloat(min_value=10, max_value=200), 2),
+                }
+                for _ in range(fake.random_int(1, 3))
+            ],
+            "subtotal": round(fake.pyfloat(min_value=20, max_value=400), 2),
+            "shipping_address": {
+                "line1": fake.street_address(),
+                "city": fake.city(),
+                "state": fake.state_abbr(),
+                "postal_code": fake.postcode(),
+                "country": "US",
+            },
+        })
+    elif "customer" in name_lc or "user" in name_lc or "account" in name_lc:
+        record.update({
+            "customer_id": arguments.get("customer_id") or f"CUST-{fake.random_int(10000, 99999)}",
+            "name": fake.name(),
+            "email": arguments.get("email") or fake.email(),
+            "phone": fake.phone_number(),
+            "created_at": fake.date_time_between(start_date="-2y").isoformat(),
+            "tier": fake.random_element(["standard", "silver", "gold", "platinum"]),
+            "lifetime_value": round(fake.pyfloat(min_value=50, max_value=5000), 2),
+            "open_tickets": fake.random_int(0, 3),
+        })
+    elif "product" in name_lc or "inventory" in name_lc or "sku" in name_lc:
+        record.update({
+            "sku": arguments.get("sku") or f"SKU-{fake.random_int(1000, 9999)}",
+            "name": fake.catch_phrase(),
+            "description": fake.sentence(nb_words=12),
+            "price": round(fake.pyfloat(min_value=5, max_value=500), 2),
+            "currency": "USD",
+            "in_stock": fake.boolean(chance_of_getting_true=80),
+            "stock_level": fake.random_int(0, 250),
+            "category": fake.random_element(["apparel", "electronics", "home", "beauty", "sports"]),
+        })
+    elif "payment" in name_lc or "invoice" in name_lc or "transaction" in name_lc:
+        record.update({
+            "transaction_id": f"txn_{fake.uuid4()[:12]}",
+            "amount": round(fake.pyfloat(min_value=5, max_value=800), 2),
+            "currency": "USD",
+            "status": fake.random_element(["succeeded", "pending", "refunded"]),
+            "method": fake.random_element(["card", "paypal", "bank_transfer"]),
+            "card_last4": fake.credit_card_number()[-4:],
+            "processed_at": fake.date_time_between(start_date="-30d").isoformat(),
+        })
+    elif "shipment" in name_lc or "tracking" in name_lc or "delivery" in name_lc:
+        record.update({
+            "tracking_number": arguments.get("tracking_number")
+                or f"1Z{fake.bothify('??#########').upper()}",
+            "carrier": fake.random_element(["UPS", "FedEx", "USPS", "DHL"]),
+            "status": fake.random_element(["in_transit", "out_for_delivery", "delivered"]),
+            "last_update": fake.date_time_between(start_date="-3d").isoformat(),
+            "last_location": f"{fake.city()}, {fake.state_abbr()}",
+            "estimated_delivery": fake.date_between(start_date="+1d", end_date="+5d").isoformat(),
+        })
+    elif "reservation" in name_lc or "booking" in name_lc:
+        record.update({
+            "confirmation_code": fake.bothify("??######").upper(),
+            "status": fake.random_element(["confirmed", "pending", "cancelled"]),
+            "start_date": fake.date_between(start_date="+1d", end_date="+30d").isoformat(),
+            "end_date": fake.date_between(start_date="+31d", end_date="+40d").isoformat(),
+            "guests": fake.random_int(1, 4),
+            "total": round(fake.pyfloat(min_value=100, max_value=2000), 2),
+            "currency": "USD",
+        })
+    else:
+        # Generic record — include some useful fields derived from inputs
+        record.update({
+            "id": f"rec_{fake.uuid4()[:12]}",
+            "created_at": fake.date_time_between(start_date="-90d").isoformat(),
+            "updated_at": fake.date_time_between(start_date="-7d").isoformat(),
+            "status": "active",
+        })
+
+    return record
+
+
+def _mock_knowledge_results(tool: AgentTool, arguments: dict, fake) -> dict:
+    """Build a search-results payload for a KnowledgeTool."""
+    query = (
+        arguments.get("query")
+        or arguments.get("question")
+        or arguments.get("search")
+        or next(iter(arguments.values()), None)
+    )
+    source_base = tool.source or tool.collection or "kb"
+    count = fake.random_int(2, 4)
+    results = []
+    for _ in range(count):
+        results.append({
+            "title": fake.sentence(nb_words=6).rstrip("."),
+            "snippet": " ".join(fake.paragraphs(nb=1)),
+            "source": f"{source_base}/articles/{fake.slug()}",
+            "score": round(fake.pyfloat(min_value=0.55, max_value=0.98), 2),
+        })
+    return {
+        "query": query,
+        "result_count": count,
+        "results": sorted(results, key=lambda r: r["score"], reverse=True),
+    }
+
+
+def _mock_action_result(tool: AgentTool, arguments: dict, fake) -> dict:
+    """Build a success-envelope payload for an ActionTool."""
+    name_lc = tool.name.lower()
+    if "refund" in name_lc:
+        id_key, id_val = "refund_id", f"re_{fake.uuid4()[:12]}"
+    elif "ticket" in name_lc:
+        id_key, id_val = "ticket_id", f"TKT-{fake.random_int(10000, 99999)}"
+    elif "cancel" in name_lc:
+        id_key, id_val = "cancellation_id", f"can_{fake.uuid4()[:12]}"
+    elif "book" in name_lc or "reserv" in name_lc:
+        id_key, id_val = "confirmation_code", fake.bothify("??######").upper()
+    elif "send" in name_lc or "email" in name_lc or "notify" in name_lc:
+        id_key, id_val = "message_id", f"msg_{fake.uuid4()[:12]}"
+    else:
+        id_key, id_val = "confirmation_id", f"cnf_{fake.uuid4()[:12]}"
+
+    return {
+        "success": True,
+        id_key: id_val,
+        "completed_at": datetime.now(UTC).isoformat(),
+        "arguments": arguments,
+    }
 
 
 def _snake(name: str) -> str:
@@ -356,7 +507,7 @@ def _span_event(span_type: str, data: dict) -> dict:
     return {
         "type": "span",
         "span_type": span_type,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "data": data,
     }
 
@@ -442,7 +593,6 @@ async def run_turn(
     parent_span_id: str | None = None,
     db: AsyncSession | None = None,
     redis_channel: str | None = None,
-    sim_mode: str = "standard",  # "standard" | "good" | "bad"
 ) -> TurnResult:
     """
     Execute one agent turn.
@@ -466,7 +616,6 @@ async def run_turn(
     spans_collected: list[dict] = []
     tool_calls_made: list[dict] = []
 
-    # Create or reuse Run
     if db and run_id is None:
         run_id = str(ulid_new())
         run = Run(
@@ -498,40 +647,96 @@ async def run_turn(
             db.add(span)
         return sid
 
+    async def _mark_terminal(status: str) -> None:
+        """Mark the Run row with a terminal status and commit, swallowing commit errors.
+
+        Used for both happy-path completion and error/cancellation paths so any
+        turn that started always reaches a terminal status (never stuck in 'running').
+        """
+        if not (db and run_id):
+            return
+        run_obj = await db.get(Run, run_id)
+        if run_obj:
+            run_obj.status = status
+            run_obj.ended_at = datetime.now(UTC)
+        try:
+            await db.commit()
+        except Exception as commit_err:
+            log.warning("executor.terminal_commit_error", status=status, error=str(commit_err))
+
+    try:
+        result = await _run_turn_body(
+            compiled=compiled,
+            history=history,
+            user_message=user_message,
+            slot_state=slot_state,
+            run_id=run_id,
+            emit_span=emit_span,
+            spans_collected=spans_collected,
+            tool_calls_made=tool_calls_made,
+            t_start=t_start,
+            total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+        )
+        if db and run_id:
+            run_obj = await db.get(Run, run_id)
+            if run_obj:
+                run_obj.status = "completed"
+                run_obj.ended_at = datetime.now(UTC)
+                run_obj.total_tokens = result.total_input_tokens + result.total_output_tokens
+                run_obj.total_cost_usd = result.estimated_cost_usd
+        if db:
+            await db.commit()
+        return result
+    except asyncio.CancelledError:
+        # Client ended the simulation or WS dropped mid-turn.
+        # CancelledError inherits from BaseException, not Exception — must be
+        # handled separately so the Run never stays 'running' forever.
+        log.info("executor.turn_cancelled", run_id=run_id)
+        await _mark_terminal("cancelled")
+        raise
+    except Exception:
+        await _mark_terminal("failed")
+        raise
+
+
+async def _run_turn_body(
+    *,
+    compiled: CompiledAgent,
+    history: list[dict],
+    user_message: str,
+    slot_state: dict[str, str] | None,
+    run_id: str | None,
+    emit_span,
+    spans_collected: list[dict],
+    tool_calls_made: list[dict],
+    t_start: float,
+    total_input_tokens: int,
+    total_output_tokens: int,
+) -> TurnResult:
     # ── Step 1: Router call ────────────────────────────────────────────────────
 
     router_model = compiled.schema_.models.router or compiled.schema_.models.primary
     router_span_id = str(ulid_new())
-    await emit_span("router_start", {"model": router_model, "sim_mode": sim_mode}, span_id=router_span_id)
+    await emit_span("router_start", {"model": router_model}, span_id=router_span_id)
 
     current_slot_state: dict[str, str] = dict(slot_state) if slot_state else {}
 
-    # In bad mode: use the looser router prompt so it misses slot extractions
-    router_system = _ROUTER_SYSTEM_BAD if sim_mode == "bad" else _ROUTER_SYSTEM
-
+    router_user_prompt = _build_router_prompt(
+        compiled, history, user_message, current_slot_state,
+    )
     router_messages = [
-        {"role": "system", "content": router_system},
-        {"role": "user", "content": _build_router_prompt(compiled, history, user_message, current_slot_state)},
+        {"role": "system", "content": _ROUTER_SYSTEM},
+        {"role": "user", "content": router_user_prompt},
     ]
 
-    try:
-        router_resp: LLMResponse = await chat_completion(
-            model=router_model,
-            messages=router_messages,
-            tools=None,
-            temperature=0.0,
-            max_tokens=512,
-        )
-        router_raw = router_resp.content.strip()
-        # Strip markdown code fences if present
-        if router_raw.startswith("```"):
-            router_raw = "\n".join(router_raw.split("\n")[1:])
-            router_raw = router_raw.rsplit("```", 1)[0].strip()
-        decision_dict = json.loads(router_raw)
-        decision = RouterDecision(**decision_dict)
-    except Exception as e:
-        log.warning("executor.router_parse_error", error=str(e))
-        decision = RouterDecision()  # Fallback: no routing
+    decision, parse_error = await _call_router_with_retry(router_model, router_messages)
+    if parse_error is not None:
+        await emit_span("router_parse_error", {
+            "error": parse_error["error"],
+            "raw_output": parse_error["raw_output"],
+            "model": router_model,
+        })
 
     # Merge newly extracted slot values into accumulated state
     if decision.extracted_slot_values:
@@ -547,8 +752,13 @@ async def run_turn(
         "decision": decision.model_dump(),
         "model": router_model,
         "slot_state": current_slot_state,
-        # Include the prompt sent to the router so it's inspectable in traces
-        "prompt": router_messages[1]["content"] if len(router_messages) > 1 else None,
+        # Both prompts captured so the dialog in the simulator can show them separately
+        "system_prompt": _ROUTER_SYSTEM,
+        "prompt": router_messages[1]["content"],
+        # Raw user message for this turn — lets the Chat tab reconstruct the
+        # conversation reliably even when a turn emits no llm_call_* spans
+        # (slot_fill / handoff / interrupt).
+        "user_message": user_message,
     })
 
     # ── Step 2: Interrupt override ─────────────────────────────────────────────
@@ -564,14 +774,39 @@ async def run_turn(
             *history,
             {"role": "user", "content": user_message},
         ]
+        interrupt_model = compiled.schema_.models.primary
+        # Wrap the interrupt chat call in the same llm_call_start/end spans as
+        # the main tool loop so the Traces UI can render its prompt + response.
+        await emit_span("llm_call_start", {
+            "model": interrupt_model,
+            "iteration": 0,
+            "n_messages": len(messages),
+            "system_prompt": system_prompt,
+            "messages": _serialize_messages(messages),
+        })
         resp = await chat_completion(
-            model=compiled.schema_.models.primary,
+            model=interrupt_model,
             messages=messages,
             max_tokens=1024,
         )
-        _update_tokens(resp, compiled, total_input_tokens, total_output_tokens)
-        if db:
-            await db.commit()
+        in_tok = resp.usage["input_tokens"]
+        out_tok = resp.usage["output_tokens"]
+        total_input_tokens += in_tok
+        total_output_tokens += out_tok
+        await emit_span("llm_call_end", {
+            "model": interrupt_model,
+            "iteration": 0,
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "stop_reason": resp.stop_reason,
+            "output": resp.content or None,
+            "tool_calls": None,
+        })
+        cost = estimate_cost(interrupt_model, total_input_tokens, total_output_tokens)
+        await _finalize_run(
+            total_input_tokens, total_output_tokens, cost, emit_span, t_start,
+            turn_type="interrupt", content=resp.content or "",
+        )
         return TurnResult(
             type="interrupt",
             content=resp.content,
@@ -579,6 +814,8 @@ async def run_turn(
             run_id=run_id,
             spans=spans_collected,
             total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+            estimated_cost_usd=cost,
             slot_state=current_slot_state,
         )
 
@@ -589,27 +826,34 @@ async def run_turn(
             "handoff": decision.handoff_triggered,
             "target": decision.handoff_target,
         })
-        if db:
-            await db.commit()
+        cost = estimate_cost(
+            compiled.schema_.models.primary, total_input_tokens, total_output_tokens,
+        )
+        handoff_content = (
+            f"I'm transferring you to {decision.handoff_target}. "
+            + (f"Context: {decision.handoff_context}" if decision.handoff_context else "")
+        )
+        await _finalize_run(
+            total_input_tokens, total_output_tokens, cost, emit_span, t_start,
+            turn_type="handoff", content=handoff_content,
+        )
         return TurnResult(
             type="handoff",
-            content=(
-                f"I'm transferring you to {decision.handoff_target}. "
-                + (f"Context: {decision.handoff_context}" if decision.handoff_context else "")
-            ),
+            content=handoff_content,
             router_decision=decision,
             run_id=run_id,
             spans=spans_collected,
+            total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+            estimated_cost_usd=cost,
             slot_state=current_slot_state,
         )
-
     # ── Step 3: Slot fill check ────────────────────────────────────────────────
 
     if decision.unfilled_slots and decision.active_condition and decision.active_goal:
         slot_name = decision.unfilled_slots[0]
         await emit_span("slot_fill", {"slot_name": slot_name})
 
-        # Find the slot definition to get ask_if_missing
         ask_question: str | None = None
         for cond in compiled.schema_.conditions:
             if cond.name == decision.active_condition:
@@ -621,38 +865,28 @@ async def run_turn(
                                 break
 
         question = ask_question or f"Could you please provide your {slot_name}?"
-        if db:
-            await db.commit()
+        cost = estimate_cost(
+            compiled.schema_.models.primary, total_input_tokens, total_output_tokens,
+        )
+        await _finalize_run(
+            total_input_tokens, total_output_tokens, cost, emit_span, t_start,
+            turn_type="slot_fill", content=question,
+        )
         return TurnResult(
             type="slot_fill",
             content=question,
             router_decision=decision,
             run_id=run_id,
             spans=spans_collected,
+            total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+            estimated_cost_usd=cost,
             slot_state=current_slot_state,
         )
 
     # ── Step 4: Assemble augmented prompt ──────────────────────────────────────
 
     system_prompt = _assemble_system_prompt(compiled, decision)
-
-    # Inject sim_mode guidance so the primary model behaves consistently with the mode
-    if sim_mode == "good":
-        system_prompt += (
-            "\n\n[SIMULATION — IDEAL BEHAVIOUR] You are demonstrating perfect agent behaviour "
-            "for golden-dataset collection. Follow every rule and sequence step exactly. "
-            "Never ask for information already provided anywhere in the conversation. "
-            "Always call the required tool before giving a response. Be specific: exact times, "
-            "prices, and confirmation numbers. Do not guess or hallucinate data."
-        )
-    elif sim_mode == "bad":
-        system_prompt += (
-            "\n\n[SIMULATION — FLAWED BEHAVIOUR] You are demonstrating suboptimal agent behaviour "
-            "for contrast-dataset collection. Occasionally: ask for information the user already "
-            "provided, give vague responses without specific details, skip confirming booking "
-            "details before proceeding, or provide general answers instead of using tools. "
-            "Be inconsistent with rule application. This is intentional for evaluation purposes."
-        )
 
     # Filter tool definitions to those available in the active goal
     available_tools = compiled.tool_definitions
@@ -677,8 +911,9 @@ async def run_turn(
     ]
 
     primary_model = compiled.schema_.models.primary
-    # good mode: deterministic; bad mode: more random; standard: default
-    primary_temperature = 0.0 if sim_mode == "good" else (0.7 if sim_mode == "bad" else 0.3)
+    final_content: str | None = None
+    last_text_from_model: str | None = None
+    hit_iteration_limit = False
 
     for iteration in range(MAX_TOOL_ITERATIONS):
         llm_span_id = str(ulid_new())
@@ -686,8 +921,9 @@ async def run_turn(
             "model": primary_model,
             "iteration": iteration,
             "n_messages": len(messages),
-            "sim_mode": sim_mode,
-            # Full prompt sent to the model — serialized for trace inspection
+            # Explicit system_prompt field for the simulator debug dialog; also
+            # included as messages[0] for complete conversation inspection.
+            "system_prompt": system_prompt,
             "messages": _serialize_messages(messages),
         }, span_id=llm_span_id)
 
@@ -695,7 +931,7 @@ async def run_turn(
             model=primary_model,
             messages=messages,
             tools=available_tools if available_tools else None,
-            temperature=primary_temperature,
+            temperature=PRIMARY_TEMPERATURE,
             max_tokens=2048,
         )
 
@@ -704,26 +940,24 @@ async def run_turn(
         total_input_tokens += in_tok
         total_output_tokens += out_tok
 
+        if resp.content:
+            last_text_from_model = resp.content
+
         await emit_span("llm_call_end", {
             "model": primary_model,
             "iteration": iteration,
             "input_tokens": in_tok,
             "output_tokens": out_tok,
             "stop_reason": resp.stop_reason,
-            # Model output — text response and/or tool calls
             "output": resp.content or None,
             "tool_calls": resp.tool_calls if resp.tool_calls else None,
         })
 
-        # No tool calls → final response
         if not resp.tool_calls:
             final_content = resp.content
             break
 
-        # Process tool calls
-        # Use OpenAI tool-call format — LiteLLM converts this to Anthropic format
-        # when the target model is Claude. Anthropic format in the message list is
-        # NOT converted back for OpenAI, which causes the "Invalid user message" error.
+        # OpenAI tool-call format — LiteLLM converts to Anthropic format for Claude.
         assistant_tool_call_msg: dict = {
             "role": "assistant",
             "content": None,
@@ -747,53 +981,68 @@ async def run_turn(
                 "arguments": tc["arguments"],
             })
 
-            result_str = await _execute_tool(tc["name"], tc["arguments"], compiled)
-            tool_calls_made.append({"tool": tc["name"], "arguments": tc["arguments"], "result": result_str})
+            try:
+                result_str = await _execute_tool(tc["name"], tc["arguments"], compiled)
+                tool_calls_made.append({
+                    "tool": tc["name"],
+                    "arguments": tc["arguments"],
+                    "result": result_str,
+                })
+                await emit_span("tool_result", {
+                    "tool": tc["name"],
+                    "result_preview": result_str[:200],
+                })
+            except Exception as exc:
+                err_msg = str(exc)
+                log.exception("executor.tool_error", tool=tc["name"])
+                await emit_span("tool_error", {
+                    "tool": tc["name"],
+                    "arguments": tc["arguments"],
+                    "error": err_msg,
+                })
+                # Hand the model a JSON error payload so it can recover gracefully
+                result_str = json.dumps({"error": err_msg, "tool": tc["name"]})
+                tool_calls_made.append({
+                    "tool": tc["name"],
+                    "arguments": tc["arguments"],
+                    "result": result_str,
+                    "error": err_msg,
+                })
 
-            await emit_span("tool_result", {
-                "tool": tc["name"],
-                "result_preview": result_str[:200],
-            })
-
-            # One message per tool result (OpenAI format; works with LiteLLM for all providers)
             tool_result_msgs.append({
                 "role": "tool",
                 "tool_call_id": tc["id"],
                 "content": result_str,
             })
 
-        # Append assistant turn + all tool results
         messages.append(assistant_tool_call_msg)
         messages.extend(tool_result_msgs)
-
     else:
-        # Hit MAX_TOOL_ITERATIONS without a text response
-        final_content = "I've processed your request. Is there anything else I can help you with?"
+        hit_iteration_limit = True
+
+    if hit_iteration_limit:
+        await emit_span("tool_loop_exceeded", {
+            "iterations": MAX_TOOL_ITERATIONS,
+            "last_tool_calls": [tc["tool"] for tc in tool_calls_made[-MAX_TOOL_ITERATIONS:]],
+        })
+        # Prefer the most recent real model text; fall back to a neutral message
+        # only if the model never produced any text across every iteration.
+        final_content = last_text_from_model or (
+            "I wasn't able to finish using the tools I have available. "
+            "Could you tell me more about what you'd like me to do?"
+        )
 
     # ── Step 6: Cost estimation and finalise run ───────────────────────────────
 
     cost = estimate_cost(primary_model, total_input_tokens, total_output_tokens)
-    duration_ms = int((time.perf_counter() - t_start) * 1000)
-
-    await emit_span("turn_complete", {
-        "duration_ms": duration_ms,
-        "total_input_tokens": total_input_tokens,
-        "total_output_tokens": total_output_tokens,
-        "estimated_cost_usd": cost,
-    })
-
-    if db and run_id:
-        run_obj = await db.get(Run, run_id)
-        if run_obj:
-            run_obj.status = "completed"
-            run_obj.ended_at = datetime.now(timezone.utc)
-            run_obj.total_tokens = total_input_tokens + total_output_tokens
-            run_obj.total_cost_usd = cost
-        await db.commit()
+    await _finalize_run(
+        total_input_tokens, total_output_tokens, cost, emit_span, t_start,
+        turn_type="response", content=final_content or "",
+    )
 
     return TurnResult(
         type="response",
-        content=final_content,
+        content=final_content or "",
         router_decision=decision,
         tool_calls_made=tool_calls_made,
         total_input_tokens=total_input_tokens,
@@ -805,7 +1054,77 @@ async def run_turn(
     )
 
 
-def _update_tokens(resp: LLMResponse, compiled: CompiledAgent,
-                   input_acc: int, output_acc: int) -> None:
-    input_acc += resp.usage["input_tokens"]
-    output_acc += resp.usage["output_tokens"]
+# ── Router helpers ─────────────────────────────────────────────────────────────
+
+async def _call_router_with_retry(
+    router_model: str,
+    router_messages: list[dict],
+) -> tuple[RouterDecision, dict | None]:
+    """
+    Call the router and parse its JSON output, retrying once on parse failure.
+
+    Returns (decision, parse_error). parse_error is None on success, otherwise
+    a dict with 'error' and 'raw_output' describing the final failure.
+    """
+    attempt_messages = list(router_messages)
+    last_raw = ""
+    last_err: Exception | None = None
+
+    for attempt in range(2):
+        try:
+            resp: LLMResponse = await chat_completion(
+                model=router_model,
+                messages=attempt_messages,
+                tools=None,
+                temperature=0.0,
+                max_tokens=512,
+            )
+            last_raw = (resp.content or "").strip()
+            cleaned = last_raw
+            if cleaned.startswith("```"):
+                cleaned = "\n".join(cleaned.split("\n")[1:])
+                cleaned = cleaned.rsplit("```", 1)[0].strip()
+            decision = RouterDecision(**json.loads(cleaned))
+            return decision, None
+        except Exception as e:
+            last_err = e
+            log.warning("executor.router_parse_error", attempt=attempt, error=str(e))
+            if attempt == 0:
+                attempt_messages = [
+                    *router_messages,
+                    {"role": "assistant", "content": last_raw},
+                    {"role": "user", "content": (
+                        "Your previous response was not valid JSON. Return ONLY the JSON "
+                        "object specified in the system instructions, with no prose, no "
+                        "code fences, and no commentary."
+                    )},
+                ]
+
+    return RouterDecision(), {"error": str(last_err), "raw_output": last_raw}
+
+
+async def _finalize_run(
+    total_input_tokens: int,
+    total_output_tokens: int,
+    cost: float,
+    emit_span,
+    t_start: float,
+    *,
+    turn_type: str,
+    content: str,
+) -> None:
+    """Emit the turn_complete span. Run-row status/ended_at is updated in run_turn().
+
+    turn_type and content are embedded in the payload so Chat-tab reconstruction
+    has a single reliable source for the final assistant output per turn, no
+    matter which branch produced it (response / slot_fill / interrupt / handoff).
+    """
+    duration_ms = int((time.perf_counter() - t_start) * 1000)
+    await emit_span("turn_complete", {
+        "duration_ms": duration_ms,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "estimated_cost_usd": cost,
+        "turn_type": turn_type,
+        "content": content,
+    })

@@ -15,6 +15,7 @@ import {
   AlertCircle,
   BookOpen,
   Bot,
+  Bug,
   ChevronLeft,
   ChevronRight,
   Clock,
@@ -37,10 +38,27 @@ import {
   SPAN_CONFIG,
   DEFAULT_SPAN_CONFIG,
   SpanRow,
+  ToolChips,
+  toolCountsFromSpans,
 } from "@/components/traces/SpanWaterfall"
+import { TurnSpanPills } from "@/components/traces/TurnSpanPills"
 import { api } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import type { RunDetail, RunStatus, Span, SessionDetail as SessionDetailType, LLMMessage } from "@/types/trace"
+
+const DEBUG_VIEW_KEY = "saras.debugView"
+
+function useDebugView(): [boolean, (value: boolean) => void] {
+  const [enabled, setEnabled] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false
+    return window.localStorage.getItem(DEBUG_VIEW_KEY) === "1"
+  })
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    window.localStorage.setItem(DEBUG_VIEW_KEY, enabled ? "1" : "0")
+  }, [enabled])
+  return [enabled, setEnabled]
+}
 
 // ── Local helpers ──────────────────────────────────────────────────────────────
 
@@ -68,23 +86,16 @@ function fmtRelative(iso: string): string {
 
 // ── Status badge ───────────────────────────────────────────────────────────────
 
-const STATUS_CLASS: Record<RunStatus, string> = {
-  running:   "bg-blue-500/10 text-blue-500 border-blue-500/20",
-  completed: "bg-emerald-500/10 text-emerald-600 border-emerald-500/20",
-  failed:    "bg-red-500/10 text-red-500 border-red-500/20",
-}
 const STATUS_DOT_CLASS: Record<RunStatus, string> = {
   running:   "bg-blue-500 animate-pulse",
   completed: "bg-emerald-500",
   failed:    "bg-red-500",
+  cancelled: "bg-muted-foreground",
 }
 
 function StatusBadge({ status }: { status: RunStatus }) {
   return (
-    <span className={cn(
-      "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium capitalize",
-      STATUS_CLASS[status] ?? "bg-muted text-muted-foreground border-border"
-    )}>
+    <span className="inline-flex items-center gap-1.5 text-xs font-medium capitalize text-muted-foreground">
       <span className={cn("size-1.5 rounded-full shrink-0", STATUS_DOT_CLASS[status] ?? "bg-muted")} />
       {status}
     </span>
@@ -99,6 +110,7 @@ interface ConversationTurn {
   userMessage: string | null
   toolCalls: Array<{ tool: string; arguments: Record<string, unknown> | null; result: string | null }>
   assistantMessage: string | null
+  turnType: string | null
   inputTokens: number
   outputTokens: number
   costUsd: number
@@ -113,25 +125,33 @@ function extractTurns(runs: RunDetail[]): ConversationTurn[] {
       (a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime()
     )
 
-    // Find primary llm_call_start: first one (not router) that has a messages array
-    const llmStart = spans.find(
-      s => s.type === "llm_call_start" && Array.isArray(s.payload?.messages)
-    )
+    // Prefer the authoritative per-turn span fields:
+    //   router_decision.payload.user_message  — raw user input for this turn
+    //   turn_complete.payload.content         — final assistant output (all turn types)
+    //   turn_complete.payload.turn_type       — response | slot_fill | interrupt | handoff
+    // Fall back to reconstruction from llm_call_* spans for older runs that
+    // predate those fields being added.
+    const routerDecision = spans.find(s => s.type === "router_decision")
+    const turnComplete   = spans.find(s => s.type === "turn_complete")
 
-    // Extract current user message: last user-role entry in messages[]
-    let userMessage: string | null = null
-    if (llmStart?.payload?.messages) {
-      const msgs = llmStart.payload.messages as LLMMessage[]
-      const userMsgs = msgs.filter(m => m.role === "user")
-      if (userMsgs.length > 0) {
-        const last = userMsgs[userMsgs.length - 1]
-        userMessage = typeof last.content === "string"
-          ? last.content
-          : last.content != null ? JSON.stringify(last.content) : null
+    let userMessage = (routerDecision?.payload?.user_message as string | undefined) ?? null
+    if (!userMessage) {
+      const llmStart = spans.find(
+        s => s.type === "llm_call_start" && Array.isArray(s.payload?.messages)
+      )
+      if (llmStart?.payload?.messages) {
+        const msgs = llmStart.payload.messages as LLMMessage[]
+        const userMsgs = msgs.filter(m => m.role === "user")
+        if (userMsgs.length > 0) {
+          const last = userMsgs[userMsgs.length - 1]
+          userMessage = typeof last.content === "string"
+            ? last.content
+            : last.content != null ? JSON.stringify(last.content) : null
+        }
       }
     }
 
-    // Collect tool calls + results (paired by order)
+    // Tool calls + results (paired by order)
     const toolCallSpans = spans.filter(s => s.type === "tool_call")
     const toolResultSpans = spans.filter(s => s.type === "tool_result")
     const toolCalls = toolCallSpans.map((tc, idx) => ({
@@ -142,25 +162,32 @@ function extractTurns(runs: RunDetail[]): ConversationTurn[] {
         : null,
     }))
 
-    // Find assistant response: last llm_call_end with non-empty output
-    const llmEnds = spans.filter(s => s.type === "llm_call_end" && s.payload?.output)
-    const llmEnd = llmEnds[llmEnds.length - 1] ?? null
+    let assistantMessage = (turnComplete?.payload?.content as string | undefined) ?? null
+    if (!assistantMessage) {
+      const llmEnds = spans.filter(s => s.type === "llm_call_end" && s.payload?.output)
+      const llmEnd = llmEnds[llmEnds.length - 1] ?? null
+      assistantMessage = (llmEnd?.payload?.output as string | null | undefined) ?? null
+    }
 
-    // Token + cost aggregation from turn_complete span (or sum llm_call_end spans)
-    const turnComplete = spans.find(s => s.type === "turn_complete")
+    const turnType     = (turnComplete?.payload?.turn_type as string | undefined) ?? null
     const inputTokens  = (turnComplete?.payload?.total_input_tokens as number | undefined) ?? 0
     const outputTokens = (turnComplete?.payload?.total_output_tokens as number | undefined) ?? 0
     const costUsd      = (turnComplete?.payload?.estimated_cost_usd as number | undefined) ?? 0
 
-    // Skip turns with no extractable content
-    if (!userMessage && !llmEnd?.payload?.output) continue
+    // Only skip turns that have literally no content to show. A cancelled turn
+    // with just a user message still gets rendered so the user can see it was
+    // attempted.
+    if (!userMessage && !assistantMessage && toolCalls.length === 0) {
+      continue
+    }
 
     turns.push({
       runId: run.id,
       runIndex: i + 1,
       userMessage,
       toolCalls,
-      assistantMessage: llmEnd?.payload?.output as string | null ?? null,
+      assistantMessage,
+      turnType,
       inputTokens,
       outputTokens,
       costUsd,
@@ -168,6 +195,25 @@ function extractTurns(runs: RunDetail[]): ConversationTurn[] {
   }
 
   return turns
+}
+
+function extractUserMessage(run: RunDetail): string | null {
+  const spans = [...run.spans].sort(
+    (a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime()
+  )
+  const routerDecision = spans.find(s => s.type === "router_decision")
+  const fromRouter = routerDecision?.payload?.user_message as string | undefined
+  if (fromRouter) return fromRouter
+
+  const llmStart = spans.find(
+    s => s.type === "llm_call_start" && Array.isArray(s.payload?.messages)
+  )
+  if (!llmStart?.payload?.messages) return null
+  const msgs = llmStart.payload.messages as LLMMessage[]
+  const userMsgs = msgs.filter(m => m.role === "user")
+  if (userMsgs.length === 0) return null
+  const last = userMsgs[userMsgs.length - 1]
+  return typeof last.content === "string" ? last.content : null
 }
 
 // ── Chat tab ───────────────────────────────────────────────────────────────────
@@ -218,7 +264,17 @@ function ToolCallBlock({
   )
 }
 
-function ChatTurn({ turn, projectId }: { turn: ConversationTurn; projectId: string }) {
+function ChatTurn({
+  turn,
+  projectId,
+  spans,
+  debugView,
+}: {
+  turn: ConversationTurn
+  projectId: string
+  spans: Span[]
+  debugView: boolean
+}) {
   return (
     <div className="space-y-3">
       {/* User bubble */}
@@ -286,6 +342,12 @@ function ChatTurn({ turn, projectId }: { turn: ConversationTurn; projectId: stri
           </Link>
         </div>
       )}
+
+      {debugView && spans.length > 0 && (
+        <div className="pl-10">
+          <TurnSpanPills spans={spans} />
+        </div>
+      )}
     </div>
   )
 }
@@ -293,11 +355,14 @@ function ChatTurn({ turn, projectId }: { turn: ConversationTurn; projectId: stri
 function ChatView({
   runs,
   projectId,
+  debugView,
 }: {
   runs: RunDetail[]
   projectId: string
+  debugView: boolean
 }) {
   const turns = extractTurns(runs)
+  const spansByRun = new Map(runs.map(r => [r.id, r.spans] as const))
 
   if (turns.length === 0) {
     return (
@@ -316,7 +381,12 @@ function ChatView({
       {turns.map((turn, i) => (
         <div key={turn.runId}>
           {i > 0 && <div className="border-t border-border/30 mb-8" />}
-          <ChatTurn turn={turn} projectId={projectId} />
+          <ChatTurn
+            turn={turn}
+            projectId={projectId}
+            spans={spansByRun.get(turn.runId) ?? []}
+            debugView={debugView}
+          />
         </div>
       ))}
     </div>
@@ -354,6 +424,10 @@ function RunWaterfall({
   )
   const depths = buildDepthMap(run.spans)
 
+  const userMessage = extractUserMessage(run)
+  const toolCounts = toolCountsFromSpans(run.spans)
+  const hasTools = Object.keys(toolCounts).length > 0
+
   return (
     <div className="border rounded-lg bg-card overflow-hidden">
       {/* Run header */}
@@ -362,17 +436,22 @@ function RunWaterfall({
         className="w-full flex items-center gap-3 px-4 py-2.5 bg-muted/30 hover:bg-muted/50 transition-colors text-left border-b border-border/50"
       >
         <ChevronRight className={cn("size-3.5 text-muted-foreground/60 shrink-0 transition-transform", !collapsed && "rotate-90")} />
-        <span className="text-xs font-medium text-muted-foreground">
-          Run {index + 1}
+        <span className="text-xs font-medium text-muted-foreground shrink-0">
+          Turn {index + 1}
         </span>
         <StatusBadge status={run.status} />
-        <span className="text-xs text-muted-foreground tabular-nums">
+        <span className="text-xs text-muted-foreground tabular-nums shrink-0">
           {fmtDur(run.started_at, run.ended_at)}
         </span>
-        <span className="text-xs text-muted-foreground tabular-nums">
-          {run.span_count ?? run.spans.length} spans
-        </span>
-        <span className="ml-auto text-[11px] text-muted-foreground/50 font-mono">
+        {userMessage && (
+          <span className="text-xs text-muted-foreground/70 truncate max-w-[240px] italic">
+            "{userMessage.length > 60 ? userMessage.slice(0, 60) + "…" : userMessage}"
+          </span>
+        )}
+        {hasTools && (
+          <ToolChips toolCounts={toolCounts} className="shrink-0" />
+        )}
+        <span className="ml-auto text-[11px] text-muted-foreground/50 font-mono shrink-0">
           {fmtRelative(run.started_at)}
         </span>
         <Link
@@ -407,6 +486,7 @@ function RunWaterfall({
                     runDurationMs={runDurationMs}
                     expanded={expanded.has(span.id)}
                     onToggle={() => toggle(span.id)}
+                    allSpans={sortedSpans}
                   />
                 </div>
               ))
@@ -725,6 +805,7 @@ export function SessionDetail() {
   const [error, setError]     = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<"chat" | "traces" | "timeline">("chat")
   const [goldenOpen, setGoldenOpen] = useState(false)
+  const [debugView, setDebugView] = useDebugView()
 
   useEffect(() => {
     if (!projectId || !sessionId) return
@@ -772,10 +853,23 @@ export function SessionDetail() {
       <TopBar
         title={breadcrumb}
         actions={session && (
-          <Button size="sm" variant="outline" onClick={() => setGoldenOpen(true)}>
-            <BookOpen className="size-3.5 mr-1.5" />
-            Add to Dataset
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setDebugView(!debugView)}
+              aria-pressed={debugView}
+              className={debugView ? "bg-muted text-foreground" : "text-muted-foreground"}
+              title={debugView ? "Hide internal span pills" : "Show internal span pills under each turn"}
+            >
+              <Bug className="size-3.5 mr-1.5" />
+              Debug view
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setGoldenOpen(true)}>
+              <BookOpen className="size-3.5 mr-1.5" />
+              Add to Dataset
+            </Button>
+          </div>
         )}
       />
 
@@ -819,7 +913,7 @@ export function SessionDetail() {
                 </TabsList>
 
                 <TabsContent value="chat">
-                  <ChatView runs={session.runs} projectId={projectId!} />
+                  <ChatView runs={session.runs} projectId={projectId!} debugView={debugView} />
                 </TabsContent>
 
                 <TabsContent value="traces">

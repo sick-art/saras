@@ -4,6 +4,11 @@
  * React Flow canvas mirroring the compiled agent's condition/goal graph.
  * Nodes pulse and highlight in real time as WebSocket span events arrive.
  *
+ * Uses dagre for automatic layout instead of manual positioning.
+ * Implements progressive disclosure:
+ *   Always visible: root, conditions, goals, sequences
+ *   Shown when activated (stays visible): tools, handoffs, interrupts
+ *
  * Span → node ID mapping (resolved upstream in SimulatorLayout):
  *   router_decision    → root pulse + active condition + active goal
  *   llm_call_start/end → root pulse
@@ -12,32 +17,28 @@
  *   interrupt_triggered → interrupt node active
  *   handoff_triggered  → handoff node active
  *
- * Node IDs are deterministic (same algorithm as GraphBuilder):
- *   root, cond-{i}, goal-{i}-{j}, tool-{i}, handoff-{i}, interrupt-{i}
- *
- * Visual treatment:
- *   "active"  → filled background + stronger border (state is resolved)
- *   "pulse"   → ring animation (computation in flight)
- *   (none)    → muted base style
+ * Node IDs are deterministic:
+ *   root, cond-{i}, goal-{i}-{j}, seq-{i}-{j}-{s}, tool-{i}, handoff-{i}, interrupt-{i}
  */
 
-import { useMemo } from "react"
+import type { AgentSchema } from "@/types/agent"
 import {
-  ReactFlow,
   Background,
-  Controls,
-  MiniMap,
-  type Node,
-  type Edge,
-  type NodeProps,
-  Handle,
-  Position,
   BackgroundVariant,
+  Controls,
+  Handle,
+  MiniMap,
+  Position,
+  ReactFlow,
   ReactFlowProvider,
+  type Edge,
+  type Node,
+  type NodeProps,
 } from "@xyflow/react"
 import "@xyflow/react/dist/style.css"
-import { Bot, GitBranch, Target, Wrench, ArrowRightLeft, Zap } from "lucide-react"
-import type { AgentSchema } from "@/types/agent"
+import dagre from "@dagrejs/dagre"
+import { ArrowRightLeft, Bot, GitBranch, List, Target, Wrench, Zap } from "lucide-react"
+import { useMemo } from "react"
 import type { NodeHighlights } from "./SimulatorLayout"
 
 // ── Node styles ────────────────────────────────────────────────────────────────
@@ -46,6 +47,7 @@ const BASE = {
   root:      { bg: "bg-primary/10",       border: "border-primary/40",      text: "text-primary" },
   condition: { bg: "bg-blue-500/10",      border: "border-blue-500/40",     text: "text-blue-700 dark:text-blue-400" },
   goal:      { bg: "bg-emerald-500/10",   border: "border-emerald-500/40",  text: "text-emerald-700 dark:text-emerald-400" },
+  sequence:  { bg: "bg-sky-500/10",       border: "border-sky-500/40",      text: "text-sky-700 dark:text-sky-400" },
   tool:      { bg: "bg-amber-500/10",     border: "border-amber-500/40",    text: "text-amber-700 dark:text-amber-400" },
   handoff:   { bg: "bg-purple-500/10",    border: "border-purple-500/40",   text: "text-purple-700 dark:text-purple-400" },
   interrupt: { bg: "bg-red-500/10",       border: "border-red-500/40",      text: "text-red-700 dark:text-red-400" },
@@ -55,6 +57,7 @@ const ACTIVE = {
   root:      { bg: "bg-primary",          border: "border-primary",         text: "text-primary-foreground" },
   condition: { bg: "bg-blue-500/25",      border: "border-blue-500",        text: "text-blue-800 dark:text-blue-300" },
   goal:      { bg: "bg-emerald-500/25",   border: "border-emerald-500",     text: "text-emerald-800 dark:text-emerald-300" },
+  sequence:  { bg: "bg-sky-500/25",       border: "border-sky-500",         text: "text-sky-800 dark:text-sky-300" },
   tool:      { bg: "bg-amber-500/25",     border: "border-amber-500",       text: "text-amber-800 dark:text-amber-300" },
   handoff:   { bg: "bg-purple-500/25",    border: "border-purple-500",      text: "text-purple-800 dark:text-purple-300" },
   interrupt: { bg: "bg-red-500/25",       border: "border-red-500",         text: "text-red-800 dark:text-red-300" },
@@ -99,14 +102,47 @@ function AgentNode({ data }: NodeProps) {
 
 const nodeTypes = { agent: AgentNode }
 
-// ── Graph layout ───────────────────────────────────────────────────────────────
+// ── Dagre auto-layout ─────────────────────────────────────────────────────────
 
-const H_GAP = 220
-const V_GAP = 120
+const DAGRE_CONFIG = {
+  rankdir: "TB" as const,
+  nodesep: 60,
+  ranksep: 80,
+  marginx: 20,
+  marginy: 20,
+}
+
+function layoutWithDagre(nodes: Node[], edges: Edge[]): Node[] {
+  if (nodes.length === 0) return nodes
+
+  const g = new dagre.graphlib.Graph()
+  g.setGraph(DAGRE_CONFIG)
+  g.setDefaultEdgeLabel(() => ({}))
+
+  for (const node of nodes) {
+    g.setNode(node.id, { width: 180, height: 60 })
+  }
+  for (const edge of edges) {
+    g.setEdge(edge.source, edge.target)
+  }
+
+  dagre.layout(g)
+
+  return nodes.map(node => {
+    const pos = g.node(node.id)
+    return {
+      ...node,
+      position: { x: pos.x - 90, y: pos.y - 30 },
+    }
+  })
+}
+
+// ── Graph builder (progressive disclosure) ────────────────────────────────────
 
 function buildGraph(
   schema: AgentSchema | null,
   highlights: NodeHighlights,
+  activatedNodes: Set<string>,
 ): { nodes: Node[]; edges: Edge[] } {
   if (!schema) return { nodes: [], edges: [] }
 
@@ -114,12 +150,12 @@ function buildGraph(
   const edges: Edge[] = []
 
   const addNode = (
-    id: string, x: number, y: number,
+    id: string,
     kind: NodeKind, label: string, description?: string,
     Icon: React.ComponentType<{ className?: string }> = Bot,
   ) => {
     nodes.push({
-      id, type: "agent", position: { x, y },
+      id, type: "agent", position: { x: 0, y: 0 },
       data: {
         kind, label, description, icon: Icon,
         highlight: highlights.get(id) ?? null,
@@ -139,35 +175,37 @@ function buildGraph(
   }
 
   // Root
-  addNode("root", 0, 0, "root", schema.name || "Agent", schema.persona?.slice(0, 60), Bot)
+  addNode("root", "root", schema.name || "Agent", schema.persona?.slice(0, 60), Bot)
 
-  // Conditions + goals
+  // Conditions + goals + sequences
   const conditions = schema.conditions ?? []
-  const condW = conditions.length * H_GAP
-  const condX0 = -(condW / 2) + H_GAP / 2
-
   conditions.forEach((cond, ci) => {
-    const cx = condX0 + ci * H_GAP
     const condId = `cond-${ci}`
-    addNode(condId, cx, V_GAP, "condition", cond.name, cond.description, GitBranch)
+    addNode(condId, "condition", cond.name, cond.description, GitBranch)
     addEdge("root", condId)
 
     const goals = cond.goals ?? []
-    const goalW = goals.length * (H_GAP * 0.8)
-    const goalX0 = cx - goalW / 2 + (H_GAP * 0.8) / 2
     goals.forEach((goal, gi) => {
       const goalId = `goal-${ci}-${gi}`
-      addNode(goalId, goalX0 + gi * (H_GAP * 0.8), V_GAP * 2, "goal", goal.name, goal.description, Target)
+      addNode(goalId, "goal", goal.name, goal.description, Target)
       addEdge(condId, goalId)
+
+      // Sequences under goals
+      const sequences = goal.sequences ?? []
+      sequences.forEach((seq, si) => {
+        const seqId = `seq-${ci}-${gi}-${si}`
+        addNode(seqId, "sequence", seq.name, seq.description, List)
+        addEdge(goalId, seqId)
+      })
     })
   })
 
-  // Tools
+  // Tools — only show if activated
   const tools = schema.tools ?? []
   tools.forEach((tool, ti) => {
     const toolId = `tool-${ti}`
-    const tx = condX0 + ti * (H_GAP * 0.75) - H_GAP * 0.5
-    addNode(toolId, tx, V_GAP * 3, "tool", tool.name, `${tool.type}: ${tool.description?.slice(0, 40)}`, Wrench)
+    if (!activatedNodes.has(toolId)) return
+    addNode(toolId, "tool", tool.name, `${tool.type}: ${tool.description?.slice(0, 40)}`, Wrench)
     conditions.forEach((cond, ci) => {
       cond.goals?.forEach((goal, gi) => {
         if (goal.tools?.includes(tool.name)) addEdge(`goal-${ci}-${gi}`, toolId, true)
@@ -175,23 +213,28 @@ function buildGraph(
     })
   })
 
-  // Handoffs
+  // Handoffs — only show if activated
   const handoffs = schema.handoffs ?? []
   handoffs.forEach((h, hi) => {
     const hId = `handoff-${hi}`
-    addNode(hId, H_GAP * 1.5 + hi * H_GAP, 0, "handoff", h.name, `→ ${h.target}`, ArrowRightLeft)
+    if (!activatedNodes.has(hId)) return
+    addNode(hId, "handoff", h.name, `→ ${h.target}`, ArrowRightLeft)
     addEdge("root", hId, true)
   })
 
-  // Interrupt triggers
+  // Interrupt triggers — only show if activated
   const interrupts = schema.interrupt_triggers ?? []
   interrupts.forEach((t, ti) => {
     const iId = `interrupt-${ti}`
-    addNode(iId, -(H_GAP * 1.5) - ti * H_GAP, 0, "interrupt", t.name, t.description, Zap)
+    if (!activatedNodes.has(iId)) return
+    addNode(iId, "interrupt", t.name, t.description, Zap)
     addEdge("root", iId, true)
   })
 
-  return { nodes, edges }
+  // Apply dagre layout
+  const laidOutNodes = layoutWithDagre(nodes, edges)
+
+  return { nodes: laidOutNodes, edges }
 }
 
 // ── MiniMap color helper ───────────────────────────────────────────────────────
@@ -200,6 +243,7 @@ const MINIMAP_COLORS: Record<NodeKind, string> = {
   root:      "hsl(var(--primary))",
   condition: "#3b82f6",
   goal:      "#10b981",
+  sequence:  "#0ea5e9",
   tool:      "#f59e0b",
   handoff:   "#a855f7",
   interrupt: "#ef4444",
@@ -211,6 +255,7 @@ const LEGEND_ITEMS: Array<{ kind: NodeKind; label: string }> = [
   { kind: "root",      label: "Agent" },
   { kind: "condition", label: "Condition" },
   { kind: "goal",      label: "Goal" },
+  { kind: "sequence",  label: "Sequence" },
   { kind: "tool",      label: "Tool" },
   { kind: "handoff",   label: "Handoff" },
   { kind: "interrupt", label: "Interrupt" },
@@ -218,13 +263,16 @@ const LEGEND_ITEMS: Array<{ kind: NodeKind; label: string }> = [
 
 function Legend() {
   return (
-    <div className="absolute bottom-2 left-2 z-10 flex flex-col gap-1 rounded-lg border border-border bg-card/90 px-2.5 py-2 backdrop-blur-sm">
+    <div className="absolute bottom-2 left-15 z-10 flex flex-col gap-1 rounded-lg border border-border bg-card/90 px-2.5 py-2 backdrop-blur-sm">
       {LEGEND_ITEMS.map(({ kind, label }) => {
         const s = BASE[kind]
         return (
           <div key={kind} className="flex items-center gap-1.5">
             <div className={`size-2.5 rounded-sm border ${s.bg} ${s.border}`} />
             <span className="text-[10px] text-muted-foreground">{label}</span>
+            {(kind === "tool" || kind === "handoff" || kind === "interrupt") && (
+              <span className="text-[9px] text-muted-foreground/50">on activate</span>
+            )}
           </div>
         )
       })}
@@ -248,10 +296,18 @@ function GraphEmptyState() {
 
 // ── Canvas ─────────────────────────────────────────────────────────────────────
 
-function GraphCanvas({ schema, highlights }: { schema: AgentSchema | null; highlights: NodeHighlights }) {
+function GraphCanvas({
+  schema,
+  highlights,
+  activatedNodes,
+}: {
+  schema: AgentSchema | null
+  highlights: NodeHighlights
+  activatedNodes: Set<string>
+}) {
   const { nodes, edges } = useMemo(
-    () => buildGraph(schema, highlights),
-    [schema, highlights],
+    () => buildGraph(schema, highlights, activatedNodes),
+    [schema, highlights, activatedNodes],
   )
 
   if (!schema) return <GraphEmptyState />
@@ -287,13 +343,14 @@ function GraphCanvas({ schema, highlights }: { schema: AgentSchema | null; highl
 interface Props {
   schema: AgentSchema | null
   highlights: NodeHighlights
+  activatedNodes: Set<string>
 }
 
-export function LiveGraph({ schema, highlights }: Props) {
+export function LiveGraph({ schema, highlights, activatedNodes }: Props) {
   return (
     <div className="h-full">
       <ReactFlowProvider>
-        <GraphCanvas schema={schema} highlights={highlights} />
+        <GraphCanvas schema={schema} highlights={highlights} activatedNodes={activatedNodes} />
       </ReactFlowProvider>
     </div>
   )

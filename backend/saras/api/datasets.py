@@ -92,6 +92,9 @@ class FromSimulationRequest(BaseModel):
     history: list[dict[str, Any]]   # OpenAI-format messages [{role, content}, ...]
     agent_id: str | None = None
     metadata: dict[str, Any] | None = None
+    tool_calls_per_turn: list[dict[str, Any]] | None = None
+    # Optional: tool calls made per turn for expected_output.tool_calls.
+    # Format: [{"turn": 0, "tool_name": "...", "required_args": [...]}, ...]
 
 
 class FromSessionRequest(BaseModel):
@@ -330,7 +333,10 @@ async def create_item_from_simulation(
         id=str(ulid_new()),
         dataset_id=dataset_id,
         input={"turns": user_turns},
-        expected_output={"turns": agent_turns},
+        expected_output={
+            "turns": agent_turns,
+            **({"tool_calls": body.tool_calls_per_turn} if body.tool_calls_per_turn else {}),
+        },
         source="auto",
         metadata_=metadata,
     )

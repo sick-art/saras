@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,11 +21,19 @@ def get_compiled():
     return compile_from_yaml(FIXTURE_YAML.read_text(), agent_id="agent-1")
 
 
+def make_mock_tool_call(tool_name: str, arguments: dict, call_id: str = "tc_1"):
+    tc = MagicMock()
+    tc.id = call_id
+    tc.function.name = tool_name
+    tc.function.arguments = json.dumps(arguments)
+    return tc
+
+
 def make_mock_raw(content: str, tool_calls=None):
     choice = MagicMock()
     choice.message.content = content
     choice.message.tool_calls = tool_calls
-    choice.finish_reason = "stop"
+    choice.finish_reason = "stop" if not tool_calls else "tool_calls"
     usage = MagicMock()
     usage.prompt_tokens = 100
     usage.completion_tokens = 50
@@ -144,6 +153,39 @@ async def test_run_turn_interrupt_triggered():
     assert result.router_decision.interrupt_triggered == "Emergency Override"
 
 
+@pytest.mark.asyncio
+async def test_interrupt_path_reports_tokens_regression():
+    """Regression guard: interrupt path previously dropped primary-call tokens
+    via a dead _update_tokens helper. Tokens must be accumulated."""
+    compiled = get_compiled()
+    call_count = 0
+
+    async def mock_completion(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return make_mock_raw(router_json(
+                interrupt_triggered="Emergency Override",
+                interrupt_action="Provide emergency services info.",
+            ))
+        return make_mock_raw("Call 911 now.")
+
+    with patch("litellm.acompletion", side_effect=mock_completion):
+        with patch("saras.db.redis.publish", new=AsyncMock()):
+            from saras.core.executor import run_turn
+
+            result = await run_turn(
+                compiled=compiled,
+                history=[],
+                user_message="emergency",
+            )
+
+    assert result.type == "interrupt"
+    # Primary model reported 100/50; router count_tokens adds more.
+    assert result.total_output_tokens >= 50
+    assert result.total_input_tokens > 0
+
+
 # ── run_turn: handoff triggered ───────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -173,20 +215,23 @@ async def test_run_turn_handoff_triggered():
     assert result.router_decision.handoff_triggered == "Human Escalation"
 
 
-# ── run_turn: router parse error fallback ─────────────────────────────────────
+# ── run_turn: router parse + retry behaviour ──────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_run_turn_router_parse_error_falls_back():
-    """If router returns invalid JSON, executor falls back to no routing."""
+async def test_router_retries_on_invalid_json():
+    """First response is garbage JSON; retry returns valid JSON. No parse-error span."""
     compiled = get_compiled()
     call_count = 0
 
     async def mock_completion(**kwargs):
         nonlocal call_count
         call_count += 1
+        # call 1: router garbage. call 2: router retry valid. call 3: primary.
         if call_count == 1:
             return make_mock_raw("THIS IS NOT JSON")
-        return make_mock_raw("I can help you with that.")
+        if call_count == 2:
+            return make_mock_raw(router_json())
+        return make_mock_raw("How can I help?")
 
     with patch("litellm.acompletion", side_effect=mock_completion):
         with patch("saras.db.redis.publish", new=AsyncMock()):
@@ -195,11 +240,45 @@ async def test_run_turn_router_parse_error_falls_back():
             result = await run_turn(
                 compiled=compiled,
                 history=[],
-                user_message="Hello",
+                user_message="Hi",
             )
 
-    # Should not raise; falls back to empty RouterDecision → calls primary model
     assert isinstance(result, TurnResult)
+    assert result.router_decision is not None
+    assert result.router_decision.active_condition == "Order Inquiry"
+    span_types = [s["span_type"] for s in result.spans]
+    assert "router_parse_error" not in span_types
+    assert call_count == 3  # router + retry + primary
+
+
+@pytest.mark.asyncio
+async def test_router_emits_parse_error_span_after_retry_exhausted():
+    """Both router attempts fail → parse_error span + empty RouterDecision."""
+    compiled = get_compiled()
+    call_count = 0
+
+    async def mock_completion(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            return make_mock_raw("still not json")
+        return make_mock_raw("Generic reply.")
+
+    with patch("litellm.acompletion", side_effect=mock_completion):
+        with patch("saras.db.redis.publish", new=AsyncMock()):
+            from saras.core.executor import run_turn
+
+            result = await run_turn(
+                compiled=compiled,
+                history=[],
+                user_message="Hi",
+            )
+
+    assert isinstance(result, TurnResult)
+    span_types = [s["span_type"] for s in result.spans]
+    assert "router_parse_error" in span_types
+    # Fallback RouterDecision is all-None
+    assert result.router_decision.active_condition is None
 
 
 # ── run_turn: slot state accumulation ────────────────────────────────────────
@@ -208,13 +287,19 @@ async def test_run_turn_router_parse_error_falls_back():
 async def test_run_turn_confirmed_slots_not_re_asked():
     """Slots already in slot_state should be filtered from unfilled_slots."""
     compiled = get_compiled()
+    call_count = 0
 
-    # Router returns "Order Number" as unfilled, but slot_state already has it
     async def mock_completion(**kwargs):
-        return make_mock_raw(router_json(
-            unfilled_slots=["Order Number"],
-            extracted_slot_values={},
-        ))
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # Router returns "Order Number" as unfilled; executor filters it out
+            # because slot_state already has it.
+            return make_mock_raw(router_json(
+                unfilled_slots=["Order Number"],
+                extracted_slot_values={},
+            ))
+        return make_mock_raw("Looks good.")
 
     with patch("litellm.acompletion", side_effect=mock_completion):
         with patch("saras.db.redis.publish", new=AsyncMock()):
@@ -224,12 +309,9 @@ async def test_run_turn_confirmed_slots_not_re_asked():
                 compiled=compiled,
                 history=[],
                 user_message="What is the status?",
-                slot_state={"Order Number": "ORD-999"},  # already confirmed
+                slot_state={"Order Number": "ORD-999"},
             )
 
-    # Since Order Number is already confirmed, unfilled_slots becomes []
-    # → executor should proceed to primary model call, not slot fill
-    # (router still returns unfilled, but executor filters confirmed ones out)
     assert result.router_decision is not None
     assert "Order Number" not in result.router_decision.unfilled_slots
 
@@ -263,6 +345,320 @@ async def test_run_turn_emits_spans():
     span_types = [s["span_type"] for s in result.spans]
     assert "router_start" in span_types
     assert "router_decision" in span_types
+
+
+@pytest.mark.asyncio
+async def test_router_decision_span_captures_user_message():
+    """router_decision carries user_message so the Chat tab can reconstruct
+    turns that emit no llm_call_* spans (slot_fill/interrupt/handoff)."""
+    compiled = get_compiled()
+    call_count = 0
+
+    async def mock_completion(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return make_mock_raw(router_json())
+        return make_mock_raw("ok")
+
+    with patch("litellm.acompletion", side_effect=mock_completion):
+        with patch("saras.db.redis.publish", new=AsyncMock()):
+            from saras.core.executor import run_turn
+
+            result = await run_turn(
+                compiled=compiled,
+                history=[],
+                user_message="where's my order",
+            )
+
+    rd = next(s for s in result.spans if s["span_type"] == "router_decision")
+    assert rd["data"]["user_message"] == "where's my order"
+
+
+@pytest.mark.asyncio
+async def test_turn_complete_span_captures_content_and_type():
+    """turn_complete includes content + turn_type for every branch — this is
+    what the Chat tab reads as the authoritative assistant output."""
+    compiled = get_compiled()
+    call_count = 0
+
+    async def mock_completion(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return make_mock_raw(router_json())
+        return make_mock_raw("Order is on its way.")
+
+    with patch("litellm.acompletion", side_effect=mock_completion):
+        with patch("saras.db.redis.publish", new=AsyncMock()):
+            from saras.core.executor import run_turn
+
+            result = await run_turn(
+                compiled=compiled,
+                history=[],
+                user_message="status?",
+            )
+
+    tc = next(s for s in result.spans if s["span_type"] == "turn_complete")
+    assert tc["data"]["content"] == "Order is on its way."
+    assert tc["data"]["turn_type"] == "response"
+
+
+@pytest.mark.asyncio
+async def test_slot_fill_turn_complete_carries_question():
+    """Slot-fill branch emits no llm_call_* spans; the chat tab relies on
+    turn_complete.content for the assistant-visible question."""
+    compiled = get_compiled()
+
+    async def mock_completion(**kwargs):
+        return make_mock_raw(router_json(unfilled_slots=["Order Number"]))
+
+    with patch("litellm.acompletion", side_effect=mock_completion):
+        with patch("saras.db.redis.publish", new=AsyncMock()):
+            from saras.core.executor import run_turn
+
+            result = await run_turn(
+                compiled=compiled,
+                history=[],
+                user_message="check it",
+            )
+
+    tc = next(s for s in result.spans if s["span_type"] == "turn_complete")
+    assert tc["data"]["turn_type"] == "slot_fill"
+    assert tc["data"]["content"]  # non-empty question
+
+
+@pytest.mark.asyncio
+async def test_interrupt_path_emits_llm_spans():
+    """Interrupt branch must emit llm_call_start/end so the Traces UI can
+    render its prompt and response — previously it called chat_completion
+    without wrapping spans, making interrupt turns disappear from the Chat tab."""
+    compiled = get_compiled()
+    call_count = 0
+
+    async def mock_completion(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return make_mock_raw(router_json(
+                interrupt_triggered="Emergency Override",
+                interrupt_action="Provide emergency info.",
+            ))
+        return make_mock_raw("Call 911 now.")
+
+    with patch("litellm.acompletion", side_effect=mock_completion):
+        with patch("saras.db.redis.publish", new=AsyncMock()):
+            from saras.core.executor import run_turn
+
+            result = await run_turn(
+                compiled=compiled,
+                history=[],
+                user_message="help",
+            )
+
+    span_types = [s["span_type"] for s in result.spans]
+    assert "llm_call_start" in span_types
+    assert "llm_call_end" in span_types
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_marks_run_cancelled():
+    """When run_turn is cancelled mid-flight, the Run row must be marked
+    'cancelled' (not left in 'running'). Without this the Traces UI showed
+    sessions stuck on 'running' forever."""
+    compiled = get_compiled()
+
+    # Router returns, then primary call hangs until cancelled.
+    call_count = 0
+
+    async def mock_completion(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return make_mock_raw(router_json())
+        # Primary call — never returns; simulates a long-running LLM call
+        await asyncio.sleep(10)
+        return make_mock_raw("unreachable")
+
+    # Minimal fake AsyncSession that records Run.status changes.
+    class FakeSession:
+        def __init__(self):
+            self.run_row = None
+            self.committed = False
+
+        def add(self, obj):
+            # Only keep Run instances around for status inspection
+            if obj.__class__.__name__ == "Run":
+                self.run_row = obj
+
+        async def flush(self):
+            pass
+
+        async def commit(self):
+            self.committed = True
+
+        async def get(self, _model, _id):
+            return self.run_row
+
+    fake_db = FakeSession()
+
+    with patch("litellm.acompletion", side_effect=mock_completion):
+        with patch("saras.db.redis.publish", new=AsyncMock()):
+            from saras.core.executor import run_turn
+
+            task = asyncio.create_task(run_turn(
+                compiled=compiled,
+                history=[],
+                user_message="slow",
+                db=fake_db,  # type: ignore[arg-type]
+            ))
+            # Give the task a chance to start the primary (mock) call, then cancel.
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    assert fake_db.run_row is not None
+    assert fake_db.run_row.status == "cancelled"
+    assert fake_db.committed is True
+
+
+@pytest.mark.asyncio
+async def test_router_decision_span_captures_system_prompt():
+    """router_decision span payload includes both system_prompt and user prompt."""
+    compiled = get_compiled()
+    call_count = 0
+
+    async def mock_completion(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return make_mock_raw(router_json())
+        return make_mock_raw("ok")
+
+    with patch("litellm.acompletion", side_effect=mock_completion):
+        with patch("saras.db.redis.publish", new=AsyncMock()):
+            from saras.core.executor import run_turn
+
+            result = await run_turn(
+                compiled=compiled,
+                history=[],
+                user_message="hey",
+            )
+
+    rd = next(s for s in result.spans if s["span_type"] == "router_decision")
+    assert "system_prompt" in rd["data"]
+    assert "prompt" in rd["data"]
+    assert "routing assistant" in rd["data"]["system_prompt"].lower()
+
+
+@pytest.mark.asyncio
+async def test_llm_call_start_span_captures_system_prompt():
+    """llm_call_start span payload has an explicit system_prompt field."""
+    compiled = get_compiled()
+    call_count = 0
+
+    async def mock_completion(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return make_mock_raw(router_json())
+        return make_mock_raw("ok")
+
+    with patch("litellm.acompletion", side_effect=mock_completion):
+        with patch("saras.db.redis.publish", new=AsyncMock()):
+            from saras.core.executor import run_turn
+
+            result = await run_turn(
+                compiled=compiled,
+                history=[],
+                user_message="hey",
+            )
+
+    lls = next(s for s in result.spans if s["span_type"] == "llm_call_start")
+    assert "system_prompt" in lls["data"]
+    assert isinstance(lls["data"]["system_prompt"], str)
+
+
+# ── run_turn: tool error path ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_tool_error_emits_span_and_continues():
+    """If _execute_tool raises, a tool_error span is emitted and the model
+    receives a JSON error payload so it can recover."""
+    compiled = get_compiled()
+    call_count = 0
+
+    async def mock_completion(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return make_mock_raw(router_json())
+        if call_count == 2:
+            return make_mock_raw(
+                "",
+                tool_calls=[make_mock_tool_call("order_lookup", {"id": "x"})],
+            )
+        return make_mock_raw("I couldn't fetch that; can you try again?")
+
+    async def raising_tool(name, args, compiled):
+        raise RuntimeError("tool exploded")
+
+    with patch("litellm.acompletion", side_effect=mock_completion):
+        with patch("saras.db.redis.publish", new=AsyncMock()):
+            with patch("saras.core.executor._execute_tool", side_effect=raising_tool):
+                from saras.core.executor import run_turn
+
+                result = await run_turn(
+                    compiled=compiled,
+                    history=[],
+                    user_message="look up my order",
+                )
+
+    span_types = [s["span_type"] for s in result.spans]
+    assert "tool_error" in span_types
+    # Follow-up LLM call should still happen
+    assert result.type == "response"
+    assert result.content
+
+
+# ── run_turn: tool loop exceeded ──────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_tool_loop_exceeded_emits_span():
+    """Model that keeps calling tools forever hits MAX_TOOL_ITERATIONS and emits
+    a tool_loop_exceeded span. final_content prefers the last non-empty text."""
+    compiled = get_compiled()
+    call_count = 0
+
+    async def mock_completion(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return make_mock_raw(router_json())
+        # Always ask for a tool; include a last-ditch text so final_content uses it
+        return make_mock_raw(
+            "still working...",
+            tool_calls=[make_mock_tool_call("order_lookup", {"id": "x"}, call_id=f"tc_{call_count}")],
+        )
+
+    async def mock_tool(name, args, compiled):
+        return json.dumps({"status": "ok"})
+
+    with patch("litellm.acompletion", side_effect=mock_completion):
+        with patch("saras.db.redis.publish", new=AsyncMock()):
+            with patch("saras.core.executor._execute_tool", side_effect=mock_tool):
+                from saras.core.executor import run_turn
+
+                result = await run_turn(
+                    compiled=compiled,
+                    history=[],
+                    user_message="go",
+                )
+
+    span_types = [s["span_type"] for s in result.spans]
+    assert "tool_loop_exceeded" in span_types
+    assert result.content == "still working..."
 
 
 # ── _build_router_prompt ──────────────────────────────────────────────────────

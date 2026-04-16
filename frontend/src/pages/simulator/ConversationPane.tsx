@@ -15,6 +15,8 @@ import { useRef, useEffect, useState, type FormEvent } from "react"
 import { Send, Bot, User, AlertTriangle, ArrowRightLeft, Info } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { TurnSpanPills } from "@/components/traces/TurnSpanPills"
+import type { Span } from "@/types/trace"
 import type { SimMessage, TurnType, WsStatus } from "./SimulatorLayout"
 
 // ── Turn type metadata ─────────────────────────────────────────────────────────
@@ -37,11 +39,13 @@ interface Props {
   isThinking: boolean
   wsStatus: WsStatus
   onSend: (content: string) => void
+  debugView: boolean
+  spansById: Map<string, Span>
 }
 
 // ── ConversationPane ───────────────────────────────────────────────────────────
 
-export function ConversationPane({ messages, isThinking, wsStatus, onSend }: Props) {
+export function ConversationPane({ messages, isThinking, wsStatus, onSend, debugView, spansById }: Props) {
   const [input, setInput] = useState("")
   const scrollRef  = useRef<HTMLDivElement>(null)
   const inputRef   = useRef<HTMLTextAreaElement>(null)
@@ -89,7 +93,7 @@ export function ConversationPane({ messages, isThinking, wsStatus, onSend }: Pro
         )}
 
         {messages.map(msg => (
-          <MessageRow key={msg.id} message={msg} />
+          <MessageRow key={msg.id} message={msg} debugView={debugView} spansById={spansById} />
         ))}
 
         {isThinking && <ThinkingBubble />}
@@ -127,7 +131,15 @@ export function ConversationPane({ messages, isThinking, wsStatus, onSend }: Pro
 
 // ── Message row ────────────────────────────────────────────────────────────────
 
-function MessageRow({ message }: { message: SimMessage }) {
+function MessageRow({
+  message,
+  debugView,
+  spansById,
+}: {
+  message: SimMessage
+  debugView: boolean
+  spansById: Map<string, Span>
+}) {
   const { role } = message
 
   // User message
@@ -195,6 +207,14 @@ function MessageRow({ message }: { message: SimMessage }) {
             </span>
           )}
         </div>
+
+        {debugView && message.spanIds && message.spanIds.length > 0 && (
+          <TurnSpanPills
+            spans={message.spanIds
+              .map(id => spansById.get(id))
+              .filter((s): s is Span => s !== undefined)}
+          />
+        )}
       </div>
     </div>
   )

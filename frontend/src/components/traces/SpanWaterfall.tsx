@@ -6,6 +6,7 @@
 import { cn } from "@/lib/utils"
 import type { Span, SpanType, LLMMessage, LLMToolCall } from "@/types/trace"
 import {
+  AlertTriangle,
   ArrowRightLeft,
   CheckCircle2,
   ChevronDown,
@@ -54,67 +55,125 @@ export interface SpanConfig {
   label: string
 }
 
+// Color philosophy: errors use red (semantic), everything else is neutral muted.
+// The span TYPE is conveyed by the label text — color shouldn't compete for attention.
+// Dot colors are kept distinct only for the timeline waterfall view.
+const NEUTRAL_PILL = "bg-muted text-foreground"
+const ERROR_PILL = "bg-red-500/10 text-red-600"
+
 export const SPAN_CONFIG: Record<string, SpanConfig> = {
   router_start: {
     icon: GitBranch, dotColor: "#8b5cf6",
-    pillText: "router", pillColor: "bg-violet-500/10 text-violet-500",
+    pillText: "router", pillColor: NEUTRAL_PILL,
     label: "Router",
   },
   router_decision: {
     icon: GitBranch, dotColor: "#7c3aed",
-    pillText: "router", pillColor: "bg-violet-500/10 text-violet-500",
+    pillText: "router", pillColor: NEUTRAL_PILL,
     label: "Router Decision",
   },
   llm_call_start: {
     icon: Cpu, dotColor: "#3b82f6",
-    pillText: "llm", pillColor: "bg-blue-500/10 text-blue-500",
+    pillText: "llm", pillColor: NEUTRAL_PILL,
     label: "LLM Call",
   },
   llm_call_end: {
     icon: Cpu, dotColor: "#2563eb",
-    pillText: "llm", pillColor: "bg-blue-500/10 text-blue-500",
+    pillText: "llm", pillColor: NEUTRAL_PILL,
     label: "LLM Response",
   },
   tool_call: {
     icon: Wrench, dotColor: "#f59e0b",
-    pillText: "tool", pillColor: "bg-amber-500/10 text-amber-600",
+    pillText: "tool", pillColor: NEUTRAL_PILL,
     label: "Tool Call",
   },
   tool_result: {
     icon: Wrench, dotColor: "#d97706",
-    pillText: "tool", pillColor: "bg-amber-500/10 text-amber-600",
+    pillText: "tool", pillColor: NEUTRAL_PILL,
     label: "Tool Result",
   },
   slot_fill: {
     icon: FormInput, dotColor: "#06b6d4",
-    pillText: "slot", pillColor: "bg-cyan-500/10 text-cyan-600",
+    pillText: "slot", pillColor: NEUTRAL_PILL,
     label: "Slot Fill",
   },
   interrupt_triggered: {
     icon: Zap, dotColor: "#ef4444",
-    pillText: "interrupt", pillColor: "bg-red-500/10 text-red-500",
+    pillText: "interrupt", pillColor: NEUTRAL_PILL,
     label: "Interrupt",
   },
   handoff_triggered: {
     icon: ArrowRightLeft, dotColor: "#f97316",
-    pillText: "handoff", pillColor: "bg-orange-500/10 text-orange-600",
+    pillText: "handoff", pillColor: NEUTRAL_PILL,
     label: "Handoff",
   },
   turn_complete: {
     icon: CheckCircle2, dotColor: "#10b981",
-    pillText: "complete", pillColor: "bg-emerald-500/10 text-emerald-600",
+    pillText: "complete", pillColor: NEUTRAL_PILL,
     label: "Turn Complete",
+  },
+  router_parse_error: {
+    icon: AlertTriangle, dotColor: "#dc2626",
+    pillText: "error", pillColor: ERROR_PILL,
+    label: "Router Parse Error",
+  },
+  tool_loop_exceeded: {
+    icon: AlertTriangle, dotColor: "#dc2626",
+    pillText: "error", pillColor: ERROR_PILL,
+    label: "Tool Loop Exceeded",
+  },
+  tool_error: {
+    icon: AlertTriangle, dotColor: "#dc2626",
+    pillText: "error", pillColor: ERROR_PILL,
+    label: "Tool Error",
   },
 }
 
 export const DEFAULT_SPAN_CONFIG: SpanConfig = {
   icon: Circle, dotColor: "#6b7280",
-  pillText: "span", pillColor: "bg-muted text-muted-foreground",
+  pillText: "span", pillColor: NEUTRAL_PILL,
   label: "Span",
 }
 
 export function getSpanConfig(type: SpanType): SpanConfig {
   return SPAN_CONFIG[type] ?? DEFAULT_SPAN_CONFIG
+}
+
+// ── Tool helpers ───────────────────────────────────────────────────────────────
+
+export function toolCountsFromSpans(spans: Span[]): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const s of spans) {
+    if (s.type === "tool_call") {
+      const name = String(s.payload?.tool ?? "tool")
+      counts[name] = (counts[name] ?? 0) + 1
+    }
+  }
+  return counts
+}
+
+export function ToolChips({
+  toolCounts,
+  className,
+}: {
+  toolCounts: Record<string, number>
+  className?: string
+}) {
+  const entries = Object.entries(toolCounts)
+  if (entries.length === 0) return null
+  return (
+    <div className={cn("flex items-center gap-1.5 flex-wrap", className)}>
+      {entries.map(([name, count]) => (
+        <span
+          key={name}
+          className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-amber-500/10 text-amber-600"
+        >
+          <Wrench className="size-2.5" />
+          {name}{count > 1 ? ` ×${count}` : ""}
+        </span>
+      ))}
+    </div>
+  )
 }
 
 // ── Depth map ──────────────────────────────────────────────────────────────────
@@ -310,9 +369,11 @@ function LLMOutputPanel({
 function RouterDecisionPanel({
   decision,
   prompt,
+  systemPrompt,
 }: {
   decision: Record<string, unknown>
   prompt?: string | null
+  systemPrompt?: string | null
 }) {
   const FIELDS = [
     ["active_condition", "Condition"],
@@ -346,6 +407,19 @@ function RouterDecisionPanel({
         </div>
       )}
 
+      {systemPrompt && (
+        <div>
+          <div className="text-[10px] font-semibold uppercase tracking-wider mb-1 text-violet-500">
+            router system prompt
+          </div>
+          <div className="rounded bg-background border border-border/50 p-2.5 max-h-48 overflow-y-auto">
+            <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-foreground/80">
+              {systemPrompt}
+            </pre>
+          </div>
+        </div>
+      )}
+
       {prompt && (
         <div>
           <div className="text-[10px] font-semibold uppercase tracking-wider mb-1 text-violet-500">
@@ -362,20 +436,86 @@ function RouterDecisionPanel({
   )
 }
 
-export function SpanDetailPanel({ span }: { span: Span }) {
+// ── Section header used inside detail panels ──────────────────────────────────
+
+function PanelSection({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <p className="text-[10px] font-semibold uppercase tracking-wider mb-2 text-muted-foreground">
+        {title}
+      </p>
+      {children}
+    </div>
+  )
+}
+
+export function SpanDetailPanel({ span, allSpans }: { span: Span; allSpans?: Span[] }) {
   const p = span.payload ?? {}
 
-  if (span.type === "llm_call_start" && p.messages) {
-    return <LLMMessagesPanel messages={p.messages as LLMMessage[]} />
+  if (span.type === "turn_complete") {
+    const toolCounts = toolCountsFromSpans(allSpans ?? [])
+    const hasTools = Object.keys(toolCounts).length > 0
+    return (
+      <div className="space-y-2">
+        <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          tools called
+        </div>
+        {hasTools
+          ? <ToolChips toolCounts={toolCounts} />
+          : <p className="text-xs text-muted-foreground italic">No tools called this turn.</p>
+        }
+      </div>
+    )
   }
 
-  if (span.type === "llm_call_end") {
+  // ── Merged LLM call view (start + end paired by iteration) ────────────────
+  if (span.type === "llm_call_end" || span.type === "llm_call_start") {
+    const endSpan = span.type === "llm_call_end"
+      ? span
+      : allSpans?.find(s => s.type === "llm_call_end" && s.payload?.iteration === p.iteration) ?? null
+    const startSpan = span.type === "llm_call_start"
+      ? span
+      : allSpans?.find(s => s.type === "llm_call_start" && s.payload?.iteration === p.iteration) ?? null
+
+    const startP = startSpan?.payload ?? {}
+    const endP = endSpan?.payload ?? {}
+
+    const messages = startP.messages as LLMMessage[] | undefined
+    const output = endP.output as string | null | undefined
+    const toolCalls = endP.tool_calls as LLMToolCall[] | null | undefined
+    const stopReason = endP.stop_reason as string | undefined
+
     return (
-      <LLMOutputPanel
-        output={p.output as string | null}
-        toolCalls={p.tool_calls as LLMToolCall[] | null}
-        stopReason={p.stop_reason as string | undefined}
-      />
+      <div className="space-y-4">
+        {/* Stats summary */}
+        <LLMStatsHeader
+          model={endP.model as string | undefined}
+          inputTokens={endP.input_tokens as number | undefined}
+          outputTokens={endP.output_tokens as number | undefined}
+          durationMs={endSpan?.duration_ms ?? null}
+          stopReason={stopReason}
+        />
+
+        {messages && messages.length > 0 && (
+          <PanelSection title={`Input (${messages.length} ${messages.length === 1 ? "message" : "messages"})`}>
+            <LLMMessagesPanel messages={messages} />
+          </PanelSection>
+        )}
+
+        {(output || (toolCalls && toolCalls.length > 0)) && (
+          <PanelSection title="Output">
+            <LLMOutputPanel
+              output={output}
+              toolCalls={toolCalls}
+              stopReason={stopReason}
+            />
+          </PanelSection>
+        )}
+
+        {!messages && !output && (!toolCalls || toolCalls.length === 0) && (
+          <p className="text-xs text-muted-foreground italic">No payload captured.</p>
+        )}
+      </div>
     )
   }
 
@@ -384,21 +524,64 @@ export function SpanDetailPanel({ span }: { span: Span }) {
       <RouterDecisionPanel
         decision={p.decision as Record<string, unknown>}
         prompt={p.prompt as string | null}
+        systemPrompt={p.system_prompt as string | null}
       />
     )
   }
 
-  if (span.type === "tool_result") {
+  // ── Merged tool call view (call + result/error paired) ────────────────────
+  if (span.type === "tool_call" || span.type === "tool_result" || span.type === "tool_error") {
+    const callSpan = span.type === "tool_call"
+      ? span
+      : allSpans?.find(s => s.type === "tool_call" && s.id === span.parent_span_id) ?? null
+    const resultSpan = span.type === "tool_call"
+      ? allSpans?.find(s => (s.type === "tool_result" || s.type === "tool_error") && s.parent_span_id === span.id) ?? null
+      : span
+
+    const callP = callSpan?.payload ?? {}
+    const resultP = resultSpan?.payload ?? {}
+    const toolName = (callP.tool ?? resultP.tool ?? p.tool) as string | undefined
+    const args = callP.arguments as Record<string, unknown> | undefined
+    const isError = resultSpan?.type === "tool_error"
+
     return (
-      <div>
-        <div className="text-[10px] font-semibold uppercase tracking-wider mb-1 text-amber-600">
-          tool result — {String(p.tool ?? "")}
-        </div>
-        <div className="rounded bg-background border border-border/50 p-2.5 overflow-x-auto">
-          <pre className="font-mono text-[11px] leading-relaxed text-foreground/80 whitespace-pre-wrap break-all">
-            {typeof p.result_preview === "string" ? p.result_preview : JSON.stringify(p, null, 2)}
-          </pre>
-        </div>
+      <div className="space-y-4">
+        <ToolStatsHeader
+          toolName={toolName}
+          durationMs={resultSpan?.duration_ms ?? callSpan?.duration_ms ?? null}
+          isError={isError}
+        />
+
+        {args && Object.keys(args).length > 0 && (
+          <PanelSection title="Arguments">
+            <div className="rounded bg-background border border-border/50 p-2.5 overflow-x-auto">
+              <pre className="font-mono text-[11px] leading-relaxed text-foreground/80 whitespace-pre-wrap break-words">
+                {JSON.stringify(args, null, 2)}
+              </pre>
+            </div>
+          </PanelSection>
+        )}
+
+        {resultSpan && (
+          <PanelSection title={isError ? "Error" : "Result"}>
+            <div className={cn(
+              "rounded border p-2.5 overflow-x-auto max-h-64 overflow-y-auto",
+              isError ? "bg-red-500/5 border-red-500/20" : "bg-background border-border/50",
+            )}>
+              <pre className={cn(
+                "font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-all",
+                isError ? "text-red-600" : "text-foreground/80",
+              )}>
+                {isError
+                  ? String(resultP.error ?? "(no error message)")
+                  : (typeof resultP.result_preview === "string"
+                      ? resultP.result_preview
+                      : JSON.stringify(resultP, null, 2))
+                }
+              </pre>
+            </div>
+          </PanelSection>
+        )}
       </div>
     )
   }
@@ -407,6 +590,61 @@ export function SpanDetailPanel({ span }: { span: Span }) {
     <pre className="font-mono text-[11px] leading-relaxed text-muted-foreground whitespace-pre-wrap break-all">
       {JSON.stringify(p, null, 2)}
     </pre>
+  )
+}
+
+// ── Stats headers ──────────────────────────────────────────────────────────────
+
+function StatPill({ label, value }: { label: string; value: string }) {
+  return (
+    <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+      <span className="text-[10px] uppercase tracking-wide">{label}</span>
+      <span className="font-medium text-foreground tabular-nums">{value}</span>
+    </span>
+  )
+}
+
+function LLMStatsHeader({
+  model, inputTokens, outputTokens, durationMs, stopReason,
+}: {
+  model?: string
+  inputTokens?: number
+  outputTokens?: number
+  durationMs: number | null
+  stopReason?: string
+}) {
+  const pills: Array<{ label: string; value: string }> = []
+  if (model) pills.push({ label: "model", value: model })
+  if (inputTokens != null) pills.push({ label: "in", value: fmt_tokens(inputTokens) })
+  if (outputTokens != null) pills.push({ label: "out", value: fmt_tokens(outputTokens) })
+  if (durationMs != null) pills.push({ label: "took", value: fmt_ms(durationMs) })
+  if (stopReason) pills.push({ label: "stop", value: stopReason })
+
+  if (pills.length === 0) return null
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pb-3 border-b border-border/40">
+      {pills.map(p => <StatPill key={p.label} label={p.label} value={p.value} />)}
+    </div>
+  )
+}
+
+function ToolStatsHeader({
+  toolName, durationMs, isError,
+}: {
+  toolName?: string
+  durationMs: number | null
+  isError: boolean
+}) {
+  const pills: Array<{ label: string; value: string }> = []
+  if (toolName) pills.push({ label: "tool", value: toolName })
+  if (durationMs != null) pills.push({ label: "took", value: fmt_ms(durationMs) })
+  if (isError) pills.push({ label: "status", value: "error" })
+
+  if (pills.length === 0) return null
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pb-3 border-b border-border/40">
+      {pills.map(p => <StatPill key={p.label} label={p.label} value={p.value} />)}
+    </div>
   )
 }
 
@@ -420,6 +658,7 @@ export function SpanRow({
   runDurationMs,
   expanded,
   onToggle,
+  allSpans,
 }: {
   span: Span
   depth: number
@@ -428,6 +667,7 @@ export function SpanRow({
   runDurationMs: number
   expanded: boolean
   onToggle: () => void
+  allSpans?: Span[]
 }) {
   const cfg   = getSpanConfig(span.type)
   const Icon  = cfg.icon
@@ -458,7 +698,7 @@ export function SpanRow({
         ? new Date(span.ended_at).getTime() - new Date(span.started_at).getTime()
         : null)
 
-  const hasPayload = Object.keys(p).length > 0
+  const hasPayload = Object.keys(p).length > 0 || span.type === "turn_complete"
   const ToggleIcon = expanded ? ChevronDown : ChevronRight
 
   return (
@@ -543,7 +783,7 @@ export function SpanRow({
           className="mb-1 rounded border border-border/50 bg-muted/20 p-3"
           style={{ marginLeft: depth * 20 + 56, marginRight: 8 }}
         >
-          <SpanDetailPanel span={span} />
+          <SpanDetailPanel span={span} allSpans={allSpans} />
         </div>
       )}
     </div>

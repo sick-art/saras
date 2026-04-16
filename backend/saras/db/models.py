@@ -168,7 +168,7 @@ class EvalSuite(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     project: Mapped["Project"] = relationship(back_populates="eval_suites")
-    runs: Mapped[list["EvalRun"]] = relationship(back_populates="suite")
+    runs: Mapped[list["EvalRun"]] = relationship(back_populates="suite", passive_deletes=True)
 
 
 class EvalRun(Base):
@@ -185,7 +185,7 @@ class EvalRun(Base):
     summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
     suite: Mapped["EvalSuite"] = relationship(back_populates="runs")
-    results: Mapped[list["EvalResult"]] = relationship(back_populates="eval_run")
+    results: Mapped[list["EvalResult"]] = relationship(back_populates="eval_run", passive_deletes=True)
 
 
 class EvalResult(Base):

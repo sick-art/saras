@@ -10,11 +10,7 @@ import { Link, useParams } from "react-router-dom"
 import {
   AlertCircle,
   ChevronRight,
-  Clock,
-  Coins,
   GitBranch,
-  Hash,
-  Layers,
   RefreshCw,
 } from "lucide-react"
 import { TopBar } from "@/components/layout/TopBar"
@@ -59,23 +55,28 @@ function formatTokens(n: number): string {
   return String(n)
 }
 
+// ── Layout constants ──────────────────────────────────────────────────────────
+
+// Fixed-width column templates ensure header + every row align identically
+// (each row is its own grid container, so `auto` columns end up ragged)
+const SESSIONS_GRID = "grid grid-cols-[1fr_88px_64px_72px_72px_72px_20px] items-center gap-x-5 px-4"
+const RUNS_GRID = "grid grid-cols-[1fr_88px_64px_72px_72px_64px_20px] items-center gap-x-5 px-4"
+
 // ── Status / source styling ────────────────────────────────────────────────────
 
 const STATUS_DOT: Record<RunStatus, string> = {
   running:   "bg-blue-500 animate-pulse",
   completed: "bg-emerald-500",
   failed:    "bg-red-500",
-}
-const STATUS_TEXT: Record<RunStatus, string> = {
-  running:   "text-blue-500",
-  completed: "text-emerald-600",
-  failed:    "text-red-500",
+  cancelled: "bg-muted-foreground",
 }
 
-const SOURCE_STYLE: Record<RunSource, string> = {
-  simulator:   "bg-violet-500/8 text-violet-500 border-violet-500/20",
-  production:  "bg-amber-500/8 text-amber-600 border-amber-500/20",
-  sdk:         "bg-sky-500/8 text-sky-500 border-sky-500/20",
+// Source pills use neutral styling — they're categorical, not semantic.
+// Type/origin info shouldn't compete with status colors for attention.
+const SOURCE_LABEL: Record<RunSource, string> = {
+  simulator:  "Simulator",
+  production: "Production",
+  sdk:        "SDK",
 }
 
 // ── Session row ────────────────────────────────────────────────────────────────
@@ -85,7 +86,10 @@ function SessionRow({ session, projectId }: { session: SessionSummary; projectId
   return (
     <Link
       to={`/projects/${projectId}/traces/sessions/${session.session_id}`}
-      className="group grid grid-cols-[1fr_auto_auto_auto_auto_auto_20px] items-center gap-x-5 px-4 py-3 border-b border-border/50 last:border-0 hover:bg-muted/30 transition-colors"
+      className={cn(
+        "group py-3 border-b border-border/50 last:border-0 hover:bg-muted/30 transition-colors",
+        SESSIONS_GRID,
+      )}
     >
       {/* Agent + session id */}
       <div className="min-w-0">
@@ -96,9 +100,9 @@ function SessionRow({ session, projectId }: { session: SessionSummary; projectId
           }
         </p>
         <div className="flex items-center gap-2 mt-0.5">
-          <span className="flex items-center gap-1">
+          <span className="flex items-center gap-1.5">
             <span className={cn("size-1.5 rounded-full shrink-0", STATUS_DOT[session.status] ?? "bg-muted")} />
-            <span className={cn("text-xs capitalize", STATUS_TEXT[session.status] ?? "text-muted-foreground")}>
+            <span className="text-xs capitalize text-muted-foreground">
               {session.status}
             </span>
           </span>
@@ -110,31 +114,27 @@ function SessionRow({ session, projectId }: { session: SessionSummary; projectId
       </div>
 
       {/* Started */}
-      <div className="flex items-center gap-1 text-xs text-muted-foreground shrink-0" title={session.started_at}>
-        <Clock className="size-3 shrink-0" />
+      <div className="text-xs text-muted-foreground tabular-nums text-right" title={session.started_at}>
         {formatRelative(session.started_at)}
       </div>
 
       {/* Duration */}
-      <div className="text-xs text-muted-foreground shrink-0 tabular-nums w-12 text-right">
+      <div className="text-xs text-muted-foreground tabular-nums text-right">
         {formatDuration(session.started_at, session.ended_at)}
       </div>
 
       {/* Runs */}
-      <div className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 tabular-nums">
-        <Layers className="size-3 shrink-0 opacity-50" />
+      <div className="text-xs text-muted-foreground tabular-nums text-right">
         {session.run_count} {session.run_count === 1 ? "run" : "runs"}
       </div>
 
       {/* Tokens */}
-      <div className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 tabular-nums">
-        <Hash className="size-3 shrink-0 opacity-50" />
+      <div className="text-xs text-muted-foreground tabular-nums text-right">
         {formatTokens(session.total_tokens)}
       </div>
 
       {/* Cost */}
-      <div className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 tabular-nums">
-        <Coins className="size-3 shrink-0 opacity-50" />
+      <div className="text-xs text-muted-foreground tabular-nums text-right">
         {formatCost(session.total_cost_usd)}
       </div>
 
@@ -207,14 +207,17 @@ function SessionsTab({ projectId }: { projectId: string }) {
     <>
       <div className="rounded-lg border bg-card overflow-hidden">
         {!loading && sessions.length > 0 && (
-          <div className="grid grid-cols-[1fr_auto_auto_auto_auto_auto_20px] items-center gap-x-5 px-4 py-2 bg-muted/30 border-b border-border/50 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60 select-none">
+          <div className={cn(
+            "py-2 bg-muted/30 border-b border-border/50 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60 select-none",
+            SESSIONS_GRID,
+          )}>
             <span>Agent</span>
-            <span>Started</span>
-            <span className="text-right w-12">Duration</span>
-            <span>Runs</span>
-            <span>Tokens</span>
-            <span>Cost</span>
-            <span className="w-3.5" />
+            <span className="text-right">Started</span>
+            <span className="text-right">Duration</span>
+            <span className="text-right">Runs</span>
+            <span className="text-right">Tokens</span>
+            <span className="text-right">Cost</span>
+            <span />
           </div>
         )}
 
@@ -265,10 +268,10 @@ function FilterPill({
     <button
       onClick={onClick}
       className={cn(
-        "rounded-full px-3 py-1 text-xs font-medium transition-colors border",
+        "rounded-md px-2.5 py-1 text-xs font-medium transition-colors capitalize",
         active
-          ? "bg-foreground text-background border-foreground"
-          : "bg-transparent text-muted-foreground border-border hover:border-foreground/40 hover:text-foreground"
+          ? "bg-muted text-foreground"
+          : "bg-transparent text-muted-foreground hover:bg-muted/50 hover:text-foreground"
       )}
     >
       {children}
@@ -282,7 +285,10 @@ function RunRow({ run, projectId }: { run: RunSummary; projectId: string }) {
   return (
     <Link
       to={`/projects/${projectId}/traces/${run.id}`}
-      className="group grid grid-cols-[1fr_auto_auto_auto_auto_auto_auto_20px] items-center gap-x-5 px-4 py-3 border-b border-border/50 last:border-0 hover:bg-muted/30 transition-colors"
+      className={cn(
+        "group py-3 border-b border-border/50 last:border-0 hover:bg-muted/30 transition-colors",
+        RUNS_GRID,
+      )}
     >
       {/* Agent name + version */}
       <div className="min-w-0">
@@ -294,18 +300,15 @@ function RunRow({ run, projectId }: { run: RunSummary; projectId: string }) {
         </p>
         <div className="flex items-center gap-2 mt-0.5">
           {/* Status */}
-          <span className="flex items-center gap-1">
+          <span className="flex items-center gap-1.5">
             <span className={cn("size-1.5 rounded-full shrink-0", STATUS_DOT[run.status] ?? "bg-muted")} />
-            <span className={cn("text-xs capitalize", STATUS_TEXT[run.status] ?? "text-muted-foreground")}>
+            <span className="text-xs capitalize text-muted-foreground">
               {run.status}
             </span>
           </span>
-          {/* Source pill */}
-          <span className={cn(
-            "rounded-full border px-1.5 py-0 text-[10px] font-medium capitalize leading-4",
-            SOURCE_STYLE[run.source] ?? "bg-muted text-muted-foreground border-border"
-          )}>
-            {run.source}
+          {/* Source pill (neutral) */}
+          <span className="rounded px-1.5 py-0 text-[10px] font-medium leading-4 bg-muted text-muted-foreground">
+            {SOURCE_LABEL[run.source] ?? run.source}
           </span>
           {/* Version */}
           {run.agent_version && (
@@ -315,34 +318,27 @@ function RunRow({ run, projectId }: { run: RunSummary; projectId: string }) {
       </div>
 
       {/* Started */}
-      <div
-        className="flex items-center gap-1 text-xs text-muted-foreground shrink-0"
-        title={run.started_at}
-      >
-        <Clock className="size-3 shrink-0" />
+      <div className="text-xs text-muted-foreground tabular-nums text-right" title={run.started_at}>
         {formatRelative(run.started_at)}
       </div>
 
       {/* Duration */}
-      <div className="text-xs text-muted-foreground shrink-0 tabular-nums w-12 text-right">
+      <div className="text-xs text-muted-foreground tabular-nums text-right">
         {formatDuration(run.started_at, run.ended_at)}
       </div>
 
       {/* Tokens */}
-      <div className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 tabular-nums">
-        <Hash className="size-3 shrink-0 opacity-50" />
+      <div className="text-xs text-muted-foreground tabular-nums text-right">
         {formatTokens(run.total_tokens)}
       </div>
 
       {/* Cost */}
-      <div className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 tabular-nums">
-        <Coins className="size-3 shrink-0 opacity-50" />
+      <div className="text-xs text-muted-foreground tabular-nums text-right">
         {formatCost(run.total_cost_usd)}
       </div>
 
       {/* Span count */}
-      <div className="flex items-center gap-1 text-xs text-muted-foreground shrink-0 tabular-nums">
-        <Layers className="size-3 shrink-0 opacity-50" />
+      <div className="text-xs text-muted-foreground tabular-nums text-right">
         {run.span_count ?? "—"}
       </div>
 
@@ -441,14 +437,17 @@ function RunsTab({ projectId }: { projectId: string }) {
       ) : (
         <div className="rounded-lg border bg-card overflow-hidden">
           {!loading && runs.length > 0 && (
-            <div className="grid grid-cols-[1fr_auto_auto_auto_auto_auto_auto_20px] items-center gap-x-5 px-4 py-2 bg-muted/30 border-b border-border/50 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60 select-none">
+            <div className={cn(
+              "py-2 bg-muted/30 border-b border-border/50 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60 select-none",
+              RUNS_GRID,
+            )}>
               <span>Agent</span>
-              <span>Started</span>
-              <span className="text-right w-12">Duration</span>
-              <span>Tokens</span>
-              <span>Cost</span>
-              <span>Spans</span>
-              <span className="w-3.5" />
+              <span className="text-right">Started</span>
+              <span className="text-right">Duration</span>
+              <span className="text-right">Tokens</span>
+              <span className="text-right">Cost</span>
+              <span className="text-right">Spans</span>
+              <span />
             </div>
           )}
 

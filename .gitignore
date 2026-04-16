@@ -32,7 +32,7 @@ dist/
 # Logs
 *.log
 
-
+# Misc
 backend/saras/api/evals.py
 backend/saras/db/migrations/versions/002_eval_schema_additions.py
 backend/saras/evals/
@@ -41,3 +41,10 @@ frontend/src/components/evals/
 frontend/src/pages/evals/
 frontend/src/types/eval.ts
 .agents/skills/shadcn/evals/
+TASKS.md
+
+.claude/*.json
+
+.pytest_cache
+
+test-results

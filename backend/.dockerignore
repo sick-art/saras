@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs (the container builds its own)
+.venv/
+venv/
+env/
+
+# Local tooling / editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Tests & fixtures not needed in the image
+tests/
+
+# Docs
+*.md
+
+# Git
+.git/
+.gitignore

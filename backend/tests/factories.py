@@ -277,6 +277,156 @@ async def create_eval_run(
     return obj
 
 
+# ── Simulator span helper ────────────────────────────────────────────────────
+
+async def create_simulator_spans(
+    db: AsyncSession,
+    run: Run,
+    *,
+    user_message: str = "Hello",
+    assistant_content: str = "Hi there!",
+    turn_type: str = "response",
+    model: str = "gpt-4o-mini",
+    tool_calls: list[dict[str, Any]] | None = None,
+) -> list[Span]:
+    """Create a realistic set of spans for one simulator turn.
+
+    Mimics what run_turn() produces through emit_span(). Each span gets an
+    explicit started_at with small sequential offsets for deterministic ordering.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    base_time = datetime(2025, 1, 15, 12, 0, 0, tzinfo=UTC)
+    spans: list[Span] = []
+    offset_ms = 0
+
+    def _next_time() -> datetime:
+        nonlocal offset_ms
+        t = base_time + timedelta(milliseconds=offset_ms)
+        offset_ms += 50
+        return t
+
+    # router_start
+    spans.append(Span(
+        id=str(ulid_new()), run_id=run.id, name="router_start", type="router_start",
+        started_at=_next_time(), ended_at=_next_time(), duration_ms=50,
+        payload={"model": model},
+    ))
+
+    # router_decision
+    decision_payload: dict[str, Any] = {
+        "user_message": user_message,
+        "decision": {
+            "active_condition": "General",
+            "active_goal": "Assist",
+            "interrupt_triggered": None,
+            "handoff_triggered": None,
+            "unfilled_slots": [],
+            "extracted_slot_values": {},
+        },
+        "model": model,
+        "system_prompt": "You are a routing assistant.",
+        "prompt": f"NEW USER MESSAGE: {user_message}",
+        "slot_state": {},
+    }
+    spans.append(Span(
+        id=str(ulid_new()), run_id=run.id, name="router_decision", type="router_decision",
+        started_at=_next_time(), ended_at=_next_time(), duration_ms=100,
+        payload=decision_payload,
+    ))
+
+    # Slot-fill / handoff / interrupt branches skip LLM calls
+    if turn_type not in ("slot_fill", "handoff"):
+        # llm_call_start
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": user_message},
+        ]
+        spans.append(Span(
+            id=str(ulid_new()), run_id=run.id, name="llm_call_start", type="llm_call_start",
+            started_at=_next_time(), ended_at=None, duration_ms=None,
+            payload={
+                "model": model, "iteration": 0,
+                "n_messages": len(messages),
+                "system_prompt": messages[0]["content"],
+                "messages": messages,
+            },
+        ))
+
+        # llm_call_end
+        tool_calls_out = None
+        if tool_calls:
+            tool_calls_out = [
+                {"id": f"tc_{i}", "name": tc["tool"], "arguments": tc.get("arguments", {})}
+                for i, tc in enumerate(tool_calls)
+            ]
+        spans.append(Span(
+            id=str(ulid_new()), run_id=run.id, name="llm_call_end", type="llm_call_end",
+            started_at=_next_time(), ended_at=_next_time(), duration_ms=200,
+            payload={
+                "model": model, "iteration": 0,
+                "input_tokens": 100, "output_tokens": 50,
+                "stop_reason": "tool_calls" if tool_calls else "end_turn",
+                "output": assistant_content if not tool_calls else None,
+                "tool_calls": tool_calls_out,
+            },
+        ))
+
+        # Tool call/result pairs
+        if tool_calls:
+            for tc in tool_calls:
+                spans.append(Span(
+                    id=str(ulid_new()), run_id=run.id, name="tool_call", type="tool_call",
+                    started_at=_next_time(), ended_at=None, duration_ms=None,
+                    payload={"tool": tc["tool"], "arguments": tc.get("arguments", {})},
+                ))
+                spans.append(Span(
+                    id=str(ulid_new()), run_id=run.id, name="tool_result", type="tool_result",
+                    started_at=_next_time(), ended_at=_next_time(), duration_ms=100,
+                    payload={"tool": tc["tool"], "result_preview": tc.get("result_preview", '{"status": "ok"}')},
+                ))
+
+    if turn_type == "slot_fill":
+        spans.append(Span(
+            id=str(ulid_new()), run_id=run.id, name="slot_fill", type="slot_fill",
+            started_at=_next_time(), ended_at=_next_time(), duration_ms=10,
+            payload={"slot_name": "Order Number"},
+        ))
+
+    if turn_type == "interrupt":
+        spans.append(Span(
+            id=str(ulid_new()), run_id=run.id, name="interrupt_triggered", type="interrupt_triggered",
+            started_at=_next_time(), ended_at=_next_time(), duration_ms=5,
+            payload={"trigger": "Emergency", "action": "Provide emergency info."},
+        ))
+
+    if turn_type == "handoff":
+        spans.append(Span(
+            id=str(ulid_new()), run_id=run.id, name="handoff_triggered", type="handoff_triggered",
+            started_at=_next_time(), ended_at=_next_time(), duration_ms=5,
+            payload={"handoff": "Human Escalation", "target": "Human Support Queue"},
+        ))
+
+    # turn_complete — always present for completed runs
+    spans.append(Span(
+        id=str(ulid_new()), run_id=run.id, name="turn_complete", type="turn_complete",
+        started_at=_next_time(), ended_at=_next_time(), duration_ms=500,
+        payload={
+            "content": assistant_content,
+            "turn_type": turn_type,
+            "duration_ms": 500,
+            "total_input_tokens": 150,
+            "total_output_tokens": 50,
+            "estimated_cost_usd": 0.001,
+        },
+    ))
+
+    for s in spans:
+        db.add(s)
+    await db.flush()
+    return spans
+
+
 async def create_eval_result(
     db: AsyncSession,
     eval_run: EvalRun,

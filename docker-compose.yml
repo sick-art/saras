@@ -4,10 +4,9 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      target: prod
     ports:
       - "3000:3000"
-    environment:
-      - VITE_API_URL=http://localhost:8000
     depends_on:
       - backend
     restart: unless-stopped

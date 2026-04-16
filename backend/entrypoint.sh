@@ -15,5 +15,9 @@ asyncio.run(init_db())
 print("DB tables ready.")
 EOF
 
+echo "Running DB migrations..."
+alembic upgrade head
+echo "Migrations applied."
+
 echo "Starting Saras API..."
 exec uvicorn saras.main:app --host 0.0.0.0 --port 8000

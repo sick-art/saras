@@ -1,11 +1,12 @@
 // TypeScript types mirroring the traces API response models.
 
-export type RunStatus = "running" | "completed" | "failed"
+export type RunStatus = "running" | "completed" | "failed" | "cancelled"
 export type RunSource = "simulator" | "production" | "sdk"
 
 export type SpanType =
   | "router_start"
   | "router_decision"
+  | "router_parse_error"
   | "interrupt_triggered"
   | "handoff_triggered"
   | "slot_fill"
@@ -13,6 +14,8 @@ export type SpanType =
   | "llm_call_end"
   | "tool_call"
   | "tool_result"
+  | "tool_error"
+  | "tool_loop_exceeded"
   | "turn_complete"
   | string // forward-compat for new span types
 
@@ -54,6 +57,13 @@ export interface SpanPayload {
   // router_decision
   decision?: Record<string, unknown>
   prompt?: string               // routing prompt sent to router
+  system_prompt?: string        // router / primary-model system prompt
+  // router_parse_error / tool_error
+  error?: string
+  raw_output?: string
+  // tool_loop_exceeded
+  iterations?: number
+  last_tool_calls?: string[]
   // slot_fill
   slot_name?: string
   // turn_complete
@@ -61,6 +71,10 @@ export interface SpanPayload {
   estimated_cost_usd?: number
   total_input_tokens?: number
   total_output_tokens?: number
+  content?: string              // final assistant output (all turn types)
+  turn_type?: string            // "response" | "slot_fill" | "interrupt" | "handoff"
+  // router_decision
+  user_message?: string         // raw user input for this turn
   // generic
   [key: string]: unknown
 }

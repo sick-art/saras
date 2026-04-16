@@ -45,13 +45,19 @@ dependencies = [
     "structlog>=24.4.0",
     "ulid-py>=1.1.0",
 
-    # Eval — deterministic metrics
+    # Mock data generation (simulator tool mocks)
+    "faker>=33.0.0",
+]
+
+[project.optional-dependencies]
+# Heavy ML-backed eval metrics (torch, transformers, etc.). Opt-in —
+# BLEU/ROUGE-L/semantic-similarity raise a clear RuntimeError if unavailable.
+evals-ml = [
     "rouge-score>=0.1.2",
     "nltk>=3.8.0",
     "sentence-transformers>=3.0.0",
 ]
 
-[project.optional-dependencies]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
@@ -65,6 +71,10 @@ dev = [
     "ruff>=0.8.0",
     "mypy>=1.13.0",
     "pre-commit>=4.0.0",
+    # Pull ML metrics into dev so `uv sync` gives a complete test environment
+    "rouge-score>=0.1.2",
+    "nltk>=3.8.0",
+    "sentence-transformers>=3.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]

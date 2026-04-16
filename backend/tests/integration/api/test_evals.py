@@ -107,6 +107,70 @@ async def test_patch_eval_suite_name(client: AsyncClient, db_session: AsyncSessi
     assert response.json()["name"] == "Updated Suite Name"
 
 
+# ── DELETE /api/projects/{project_id}/evals/suites/{suite_id} ─────────────────
+
+async def test_delete_eval_suite_returns_204(client: AsyncClient, db_session: AsyncSession):
+    project = await create_project(db_session)
+    suite = await create_eval_suite(db_session, project, name="To Delete")
+
+    response = await client.delete(
+        f"/api/projects/{project.id}/evals/suites/{suite.id}"
+    )
+    assert response.status_code == 204
+
+    # Verify suite no longer appears in list
+    list_resp = await client.get(f"/api/projects/{project.id}/evals/suites")
+    assert all(s["id"] != suite.id for s in list_resp.json())
+
+
+async def test_delete_eval_suite_not_found_returns_404(
+    client: AsyncClient, db_session: AsyncSession
+):
+    project = await create_project(db_session)
+    response = await client.delete(
+        f"/api/projects/{project.id}/evals/suites/NOTEXIST00000000000000001"
+    )
+    assert response.status_code == 404
+
+
+async def test_delete_eval_suite_wrong_project_returns_404(
+    client: AsyncClient, db_session: AsyncSession
+):
+    project_a = await create_project(db_session, name="Project A")
+    project_b = await create_project(db_session, name="Project B")
+    suite = await create_eval_suite(db_session, project_a)
+
+    response = await client.delete(
+        f"/api/projects/{project_b.id}/evals/suites/{suite.id}"
+    )
+    assert response.status_code == 404
+
+
+async def test_delete_eval_suite_cascades_runs_and_results(
+    client: AsyncClient, db_session: AsyncSession
+):
+    project = await create_project(db_session)
+    agent = await create_agent(db_session, project)
+    dataset = await create_dataset(db_session, project)
+    item = await create_dataset_item(db_session, dataset)
+    suite = await create_eval_suite(db_session, project)
+    eval_run = await create_eval_run(db_session, suite, dataset, agent=agent)
+    await create_eval_result(db_session, eval_run, item)
+
+    response = await client.delete(
+        f"/api/projects/{project.id}/evals/suites/{suite.id}"
+    )
+    assert response.status_code == 204
+
+    # Suite, run, and result should all be gone
+    suite_resp = await client.get(f"/api/projects/{project.id}/evals/suites/{suite.id}")
+    assert suite_resp.status_code == 404
+
+    runs_resp = await client.get(f"/api/projects/{project.id}/evals/runs")
+    run_ids = [r["id"] for r in runs_resp.json()]
+    assert eval_run.id not in run_ids
+
+
 # ── POST .../suites/{suite_id}/runs ──────────────────────────────────────────
 
 async def test_trigger_eval_run_returns_accepted(

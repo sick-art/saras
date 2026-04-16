@@ -13,23 +13,25 @@
  *   turn_start        {}
  *   agent_message     { content, turn_type, router_decision }
  *   turn_end          { tokens: { input, output }, cost_usd, run_id }
- *   turn_cancelled    {}   — emitted when end_simulation aborts a running turn
+ *   turn_cancelled    {}   — emitted when end_session aborts a running turn
  *   span              { span_type, data }
  *   error             { message }
  *   reset_ack         {}
- *   simulation_ended  {}   — ack for end_simulation; triggers auto-reconnect
+ *   session_ended     {}   — ack for end_session; backend has cancelled any
+ *                            in-flight turn and marked its Run row 'cancelled'
  *
  * Span → node ID mapping lives in resolveHighlights() below.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useParams, Link } from "react-router-dom"
-import { ChevronLeft, RotateCcw, Wifi, WifiOff, Loader2, Square, StopCircle, BookOpen } from "lucide-react"
+import { ChevronLeft, RotateCcw, Wifi, WifiOff, Loader2, Square, BookOpen, Bug } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@/components/ui/resizable"
 import { api } from "@/lib/api"
 import type { AgentRecord, AgentSchema } from "@/types/agent"
+import type { Span, SpanType } from "@/types/trace"
 import { ConversationPane } from "./ConversationPane"
 import { LiveGraph } from "./LiveGraph"
 import { SaveAsGoldenDialog } from "@/components/evals/SaveAsGoldenDialog"
@@ -38,7 +40,6 @@ import { SaveAsGoldenDialog } from "@/components/evals/SaveAsGoldenDialog"
 
 export type WsStatus = "connecting" | "connected" | "disconnected" | "error" | "ended"
 export type TurnType = "response" | "slot_fill" | "interrupt" | "handoff"
-export type SimMode = "standard" | "good" | "bad"
 
 export interface SimMessage {
   id: string
@@ -47,6 +48,32 @@ export interface SimMessage {
   turn_type?: TurnType
   tokens?: { input: number; output: number }
   cost_usd?: number
+  spanIds?: string[]
+}
+
+const DEBUG_VIEW_KEY = "saras.debugView"
+
+function spanFromEvent(event: Record<string, unknown>): Span | null {
+  const data = (event.data ?? {}) as Record<string, unknown>
+  const id = data.span_id as string | undefined
+  const runId = data.run_id as string | undefined
+  const spanType = event.span_type as string | undefined
+  const timestamp = event.timestamp as string | undefined
+  if (!id || !spanType || !timestamp) return null
+  // Strip wrapper fields from payload; keep everything else for SpanDetailPanel
+  const { span_id: _span_id, run_id: _run_id, ...payload } = data
+  void _span_id; void _run_id
+  return {
+    id,
+    run_id: runId ?? "",
+    parent_span_id: null,
+    name: spanType,
+    type: spanType as SpanType,
+    started_at: timestamp,
+    ended_at: null,
+    duration_ms: (payload.duration_ms as number | undefined) ?? null,
+    payload: payload as Span["payload"],
+  }
 }
 
 /** nodeId → highlight kind (expires after timeout set in addHighlight) */
@@ -75,10 +102,25 @@ export function SimulatorLayout() {
   const [wsStatus, setWsStatus] = useState<WsStatus>("disconnected")
   const [messages, setMessages] = useState<SimMessage[]>([])
   const [isThinking, setIsThinking] = useState(false)
-  const [simMode, setSimMode] = useState<SimMode>("standard")
+
+  // Debug view (persisted across sessions via localStorage)
+  const [debugView, setDebugView] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false
+    return window.localStorage.getItem(DEBUG_VIEW_KEY) === "1"
+  })
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    window.localStorage.setItem(DEBUG_VIEW_KEY, debugView ? "1" : "0")
+  }, [debugView])
+
+  // Span capture: every span emitted this session, keyed by span id.
+  const [spansById, setSpansById] = useState<Map<string, Span>>(new Map())
 
   // Node highlights for LiveGraph
   const [highlights, setHighlights] = useState<NodeHighlights>(new Map())
+
+  // Progressive disclosure: nodes that have been activated (persist until reset)
+  const [activatedNodes, setActivatedNodes] = useState<Set<string>>(new Set())
 
   // Save as golden
   const [goldenOpen, setGoldenOpen] = useState(false)
@@ -89,14 +131,13 @@ export function SimulatorLayout() {
   const lastDecisionRef = useRef<Record<string, unknown> | null>(null)
   const timerMapRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const connectedRef = useRef(false)
-  const simModeRef = useRef<SimMode>("standard")
   const endedRef = useRef(false)
-  // Stable ref to reconnect so the WS onmessage closure can call the latest version
-  const reconnectRef = useRef<(() => void) | null>(null)
+  // Span IDs that have arrived for the in-flight turn; drained into the last
+  // agent message on turn_end so pills attach to the correct turn.
+  const pendingSpanIdsRef = useRef<string[]>([])
 
   // Keep refs in sync with state / callbacks
   useEffect(() => { schemaRef.current = schema }, [schema])
-  useEffect(() => { simModeRef.current = simMode }, [simMode])
 
   // ── Load schema from API ───────────────────────────────────────────────────
 
@@ -118,6 +159,10 @@ export function SimulatorLayout() {
 
   const addHighlight = useCallback((nodeId: string, kind: "pulse" | "active", ms = 2000) => {
     setHighlights(prev => { const m = new Map(prev); m.set(nodeId, kind); return m })
+    // Track activated nodes for progressive disclosure (tools, handoffs, interrupts)
+    if (nodeId.startsWith("tool-") || nodeId.startsWith("handoff-") || nodeId.startsWith("interrupt-")) {
+      setActivatedNodes(prev => { if (prev.has(nodeId)) return prev; const s = new Set(prev); s.add(nodeId); return s })
+    }
     const existing = timerMapRef.current.get(nodeId)
     if (existing) clearTimeout(existing)
     const t = setTimeout(() => {
@@ -200,7 +245,7 @@ export function SimulatorLayout() {
     connectedRef.current = false
     endedRef.current = false
 
-    const url = `${WS_BASE}/api/projects/${projectId}/agents/${agentId}/simulate?mode=${simMode}`
+    const url = `${WS_BASE}/api/projects/${projectId}/agents/${agentId}/simulate`
     setWsStatus("connecting")
     const ws = new WebSocket(url)
     wsRef.current = ws
@@ -239,19 +284,36 @@ export function SimulatorLayout() {
         case "turn_end": {
           const tok = msg.tokens as { input: number; output: number } | undefined
           const cost = msg.cost_usd as number | undefined
-          if (tok) {
-            setMessages(prev => {
-              const idx = [...prev].reverse().findIndex(m => m.role === "agent")
-              if (idx < 0) return prev
-              const ri = prev.length - 1 - idx
-              return prev.map((m, i) => i === ri ? { ...m, tokens: tok, cost_usd: cost } : m)
-            })
-          }
+          const pendingIds = [...pendingSpanIdsRef.current]
+          pendingSpanIdsRef.current = []
+          setMessages(prev => {
+            const idx = [...prev].reverse().findIndex(m => m.role === "agent")
+            if (idx < 0) return prev
+            const ri = prev.length - 1 - idx
+            return prev.map((m, i) => i === ri
+              ? {
+                  ...m,
+                  ...(tok ? { tokens: tok, cost_usd: cost } : {}),
+                  spanIds: [...(m.spanIds ?? []), ...pendingIds],
+                }
+              : m)
+          })
           break
         }
 
         case "span": {
-          const pairs = resolveHighlights(msg.span_type as string, (msg.data ?? {}) as Record<string, unknown>)
+          const spanType = msg.span_type as string
+          const data = (msg.data ?? {}) as Record<string, unknown>
+          const span = spanFromEvent(msg)
+          if (span) {
+            pendingSpanIdsRef.current.push(span.id)
+            setSpansById(prev => {
+              const next = new Map(prev)
+              next.set(span.id, span)
+              return next
+            })
+          }
+          const pairs = resolveHighlights(spanType, data)
           pairs.forEach(([id, kind]) => addHighlight(id, kind))
           break
         }
@@ -268,20 +330,16 @@ export function SimulatorLayout() {
           setMessages(prev => [...prev, { id: uid(), role: "system", content: "Session ended." }])
           break
 
-        case "simulation_ended":
-          // Force-reconnect to pick up any agent changes saved since last connect
-          endedRef.current = true
-          setIsThinking(false)
-          reconnectRef.current?.()
-          break
-
         case "turn_cancelled":
           setIsThinking(false)
           break
 
         case "reset_ack":
           setHighlights(new Map())
+          setActivatedNodes(new Set())
           lastDecisionRef.current = null
+          pendingSpanIdsRef.current = []
+          setSpansById(new Map())
           setMessages([{ id: uid(), role: "system", content: "Conversation reset." }])
           break
       }
@@ -307,7 +365,7 @@ export function SimulatorLayout() {
       ws.close()
       timerMapRef.current.forEach(t => clearTimeout(t))
     }
-  }, [projectId, agentId, simMode, resolveHighlights, addHighlight])
+  }, [projectId, agentId, resolveHighlights, addHighlight])
 
   // ── Reconnect ──────────────────────────────────────────────────────────────
 
@@ -330,9 +388,10 @@ export function SimulatorLayout() {
     setMessages([])
     setIsThinking(false)
     setHighlights(new Map())
+    setSpansById(new Map())
+    pendingSpanIdsRef.current = []
 
-    const currentMode = simModeRef.current
-    const url = `${WS_BASE}/api/projects/${projectId}/agents/${agentId}/simulate?mode=${currentMode}`
+    const url = `${WS_BASE}/api/projects/${projectId}/agents/${agentId}/simulate`
     const ws = new WebSocket(url)
     wsRef.current = ws
 
@@ -355,18 +414,35 @@ export function SimulatorLayout() {
         case "turn_end": {
           const tok = msg.tokens as { input: number; output: number } | undefined
           const cost = msg.cost_usd as number | undefined
-          if (tok) {
-            setMessages(p => {
-              const idx = [...p].reverse().findIndex(m => m.role === "agent")
-              if (idx < 0) return p
-              const ri = p.length - 1 - idx
-              return p.map((m, i) => i === ri ? { ...m, tokens: tok, cost_usd: cost } : m)
-            })
-          }
+          const pendingIds = [...pendingSpanIdsRef.current]
+          pendingSpanIdsRef.current = []
+          setMessages(p => {
+            const idx = [...p].reverse().findIndex(m => m.role === "agent")
+            if (idx < 0) return p
+            const ri = p.length - 1 - idx
+            return p.map((m, i) => i === ri
+              ? {
+                  ...m,
+                  ...(tok ? { tokens: tok, cost_usd: cost } : {}),
+                  spanIds: [...(m.spanIds ?? []), ...pendingIds],
+                }
+              : m)
+          })
           break
         }
         case "span": {
-          const pairs = resolveHighlights(msg.span_type as string, (msg.data ?? {}) as Record<string, unknown>)
+          const spanType = msg.span_type as string
+          const data = (msg.data ?? {}) as Record<string, unknown>
+          const span = spanFromEvent(msg)
+          if (span) {
+            pendingSpanIdsRef.current.push(span.id)
+            setSpansById(prev => {
+              const next = new Map(prev)
+              next.set(span.id, span)
+              return next
+            })
+          }
+          const pairs = resolveHighlights(spanType, data)
           pairs.forEach(([id, kind]) => addHighlight(id, kind))
           break
         }
@@ -380,17 +456,15 @@ export function SimulatorLayout() {
           setIsThinking(false)
           setMessages(p => [...p, { id: uid(), role: "system", content: "Session ended." }])
           break
-        case "simulation_ended":
-          endedRef.current = true
-          setIsThinking(false)
-          reconnectRef.current?.()
-          break
         case "turn_cancelled":
           setIsThinking(false)
           break
         case "reset_ack":
           setHighlights(new Map())
+          setActivatedNodes(new Set())
           lastDecisionRef.current = null
+          pendingSpanIdsRef.current = []
+          setSpansById(new Map())
           setMessages([{ id: uid(), role: "system", content: "Conversation reset." }])
           break
       }
@@ -412,9 +486,6 @@ export function SimulatorLayout() {
     }
   }, [projectId, agentId, resolveHighlights, addHighlight])
 
-  // Keep reconnectRef always pointing at the latest reconnect so WS message
-  // handlers (closures) can call it without stale-closure issues.
-  useEffect(() => { reconnectRef.current = reconnect }, [reconnect])
 
   // ── Send helpers ───────────────────────────────────────────────────────────
 
@@ -434,37 +505,16 @@ export function SimulatorLayout() {
   const endSession = useCallback(() => {
     const ws = wsRef.current
     if (ws && ws.readyState === WebSocket.OPEN) {
+      // Backend cancels any in-flight turn (run_turn's CancelledError handler
+      // marks the Run row 'cancelled' and syncs DuckDB), then replies with
+      // session_ended which closes the WS.
       ws.send(JSON.stringify({ type: "end_session" }))
     } else {
-      // Already disconnected — just mark as ended locally
+      // Already disconnected — mark as ended locally.
       setWsStatus("ended")
       setIsThinking(false)
       setMessages(prev => [...prev, { id: uid(), role: "system", content: "Session ended." }])
     }
-  }, [])
-
-  const endSimulation = useCallback(() => {
-    const ws = wsRef.current
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      // Ask the backend to cancel any in-flight turn and close; the server
-      // replies with simulation_ended which triggers an auto-reconnect,
-      // picking up any agent changes saved since this session started.
-      ws.send(JSON.stringify({ type: "end_simulation" }))
-    } else {
-      // Already disconnected — just reconnect fresh
-      reconnectRef.current?.()
-    }
-  }, [])
-
-  const changeMode = useCallback((mode: SimMode) => {
-    // Update mode — the useEffect (which depends on simMode) will handle
-    // closing the old WS and opening a new one with the new mode.
-    // Reset conversation state so the new session starts clean.
-    setSimMode(mode)
-    setMessages([])
-    setIsThinking(false)
-    setHighlights(new Map())
-    lastDecisionRef.current = null
   }, [])
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -487,8 +537,8 @@ export function SimulatorLayout() {
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
-          {/* Simulation mode selector — always visible */}
-          <SimModeSelector mode={simMode} onChange={changeMode} disabled={wsStatus === "connecting"} />
+          {/* Debug view toggle — surfaces internal spans as clickable pills below each assistant turn. */}
+          <DebugViewToggle enabled={debugView} onChange={setDebugView} />
 
           {/* Reconnect / New Session — shown when not live */}
           {(wsStatus === "disconnected" || wsStatus === "error" || wsStatus === "ended") && (
@@ -516,18 +566,7 @@ export function SimulatorLayout() {
             Reset
           </Button>
 
-          {/* End Simulation — stops any running turn, reconnects fresh to pick up agent changes */}
-          <Button
-            size="sm"
-            variant="destructive"
-            onClick={endSimulation}
-            disabled={wsStatus === "connecting"}
-          >
-            <StopCircle data-icon="inline-start" />
-            End Simulation
-          </Button>
-
-          {/* End — only visible when connected */}
+          {/* End session — cancels any in-flight turn server-side and closes the WS */}
           {wsStatus === "connected" && (
             <Button
               size="sm"
@@ -535,7 +574,7 @@ export function SimulatorLayout() {
               onClick={endSession}
             >
               <Square data-icon="inline-start" />
-              End
+              End session
             </Button>
           )}
         </div>
@@ -564,11 +603,13 @@ export function SimulatorLayout() {
             isThinking={isThinking}
             wsStatus={wsStatus}
             onSend={sendMessage}
+            debugView={debugView}
+            spansById={spansById}
           />
         </ResizablePanel>
         <ResizableHandle withHandle />
         <ResizablePanel defaultSize="55%" minSize="30%">
-          <LiveGraph schema={schema} highlights={highlights} />
+          <LiveGraph schema={schema} highlights={highlights} activatedNodes={activatedNodes} />
         </ResizablePanel>
       </ResizablePanelGroup>
     </div>
@@ -610,45 +651,26 @@ function WsStatusBadge({ status }: { status: WsStatus }) {
   )
 }
 
-// ── Sim mode selector ──────────────────────────────────────────────────────────
+// ── Debug view toggle ─────────────────────────────────────────────────────────
 
-const MODE_CONFIG: Record<SimMode, { label: string; className: string }> = {
-  standard: { label: "Standard", className: "text-muted-foreground" },
-  good:     { label: "Perfect",  className: "text-emerald-600" },
-  bad:      { label: "Flawed",   className: "text-amber-600" },
-}
-
-function SimModeSelector({
-  mode,
+function DebugViewToggle({
+  enabled,
   onChange,
-  disabled,
 }: {
-  mode: SimMode
-  onChange: (m: SimMode) => void
-  disabled: boolean
+  enabled: boolean
+  onChange: (value: boolean) => void
 }) {
   return (
-    <div className="flex items-center rounded-md border border-border overflow-hidden text-[11px] font-medium shrink-0">
-      {(["good", "standard", "bad"] as SimMode[]).map((m) => {
-        const { label, className } = MODE_CONFIG[m]
-        const active = mode === m
-        return (
-          <button
-            key={m}
-            disabled={disabled}
-            onClick={() => onChange(m)}
-            className={[
-              "px-2.5 py-1 transition-colors",
-              active
-                ? `bg-muted ${className}`
-                : "text-muted-foreground hover:bg-muted/50",
-              disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer",
-            ].join(" ")}
-          >
-            {label}
-          </button>
-        )
-      })}
-    </div>
+    <Button
+      size="sm"
+      variant="outline"
+      onClick={() => onChange(!enabled)}
+      aria-pressed={enabled}
+      className={enabled ? "bg-muted text-foreground" : "text-muted-foreground"}
+      title={enabled ? "Hide internal span pills" : "Show internal span pills under each turn"}
+    >
+      <Bug data-icon="inline-start" />
+      Debug view
+    </Button>
   )
 }
