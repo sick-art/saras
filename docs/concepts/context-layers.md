@@ -27,24 +27,7 @@ Layers 1–6 are produced up front by [compiler.py](../../backend/saras/core/com
 
 The executor's `_assemble_system_prompt(compiled, decision)` picks layers by label based on the `RouterDecision`:
 
-```mermaid
-flowchart TD
-    START([run_turn]) --> R1[Layer 1 · base · always]
-    R1 --> MODE{decision type}
-    MODE -->|interrupt| IE[Append EMERGENCY OVERRIDE block<br/>skip goal layers]
-    MODE -->|handoff| HE[Append HANDOFF block<br/>skip goal layers]
-    MODE -->|goal| L2[Layer 2 · active condition]
-    L2 --> L3[Layer 3 · active goal]
-    L3 --> L5[Layer 5 · all sequences for the goal]
-    L5 --> L6[Layer 6 · goal rules + scoped tools]
-    IE --> CALL
-    HE --> CALL
-    L6 --> CALL[chat_completion with messages + scoped tools]
-    CALL --> TL{tool_calls?}
-    TL -->|yes| TOOL[Execute → append Layer 7 · tool results]
-    TOOL --> CALL
-    TL -->|no| DONE
-```
+![Context layer assembly: always inject Layer 1, then branch on decision type — interrupt/handoff skip goal layers, goal path adds Layers 2, 3, 5, 6 → chat_completion loop with Layer 7 tool results until no more tool_calls](../assets/diagrams/context-layers-assembly.excalidraw)
 
 Two branches skip goal layers entirely:
 

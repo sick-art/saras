@@ -37,6 +37,7 @@ theme:
 
 plugins:
   - search
+  - excalidraw
 
 markdown_extensions:
   - admonition
@@ -76,6 +77,12 @@ nav:
   - Self-Hosting: self-hosting.md
   - SDK: sdk.md
   - Changelog: changelog.md
+
+extra_css:
+  - assets/excalidraw-light-mode.css
+
+extra_javascript:
+  - assets/excalidraw-light-mode.js
 
 extra:
   social:

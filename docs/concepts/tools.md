@@ -106,20 +106,7 @@ Notes:
 
 ## Tool Execution
 
-```mermaid
-flowchart LR
-    LLM[Primary model] -->|tool_calls| EXEC[_execute_tool]
-    EXEC --> TYPE{tool.type}
-    TYPE --> LOOK[LookupTool → record<br/>orders · customers · products · payments · shipments · reservations]
-    TYPE --> KB[KnowledgeTool → results list<br/>title · snippet · source · score]
-    TYPE --> ACT[ActionTool → success envelope<br/>refund_id · ticket_id · confirmation_code]
-    LOOK --> RESULT[JSON payload]
-    KB --> RESULT
-    ACT --> RESULT
-    RESULT --> EMIT[tool_result span]
-    EMIT --> FEED[Append as role=tool message]
-    FEED --> LLM
-```
+![Tool execution: Primary model tool_calls → _execute_tool → switch on tool.type (LookupTool, KnowledgeTool, ActionTool) → JSON payload → tool_result span → append as role=tool message → back to the primary model](../assets/diagrams/tool-execution.excalidraw)
 
 Phase 2 uses **deterministic Faker-backed mocks** seeded from `(tool.name, arguments)` so repeated calls return the same payload — useful for testing and for the simulator. Phase 3 will route to `tool.endpoint` via HTTP.
 

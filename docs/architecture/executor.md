@@ -8,28 +8,7 @@ The executor is the runtime core of Saras. It takes a `CompiledAgent` plus a con
 
 ## Turn Lifecycle
 
-```mermaid
-flowchart TD
-    START([run_turn]) --> PRE{db + run_id?}
-    PRE -- new --> NEWRUN[INSERT runs row<br/>status=running]
-    PRE -- exists --> R1
-    NEWRUN --> R1[1 · Router LLM call<br/>RouterDecision JSON]
-    R1 --> INT{interrupt?}
-    INT -- yes --> IP[Emit interrupt_triggered<br/>Primary LLM call<br/>return type=interrupt]
-    INT -- no --> HO{handoff?}
-    HO -- yes --> HP[Emit handoff_triggered<br/>return canned transfer text<br/>type=handoff]
-    HO -- no --> SLOT{unfilled required slot?}
-    SLOT -- yes --> SF[Emit slot_fill<br/>return ask_if_missing prompt<br/>type=slot_fill]
-    SLOT -- no --> ASM[Assemble system prompt<br/>Layer 1 + 2 + 3 + 5 + 6]
-    ASM --> FTOOLS[Filter tool_definitions to<br/>active goal's tool list]
-    FTOOLS --> LOOP[4 · Tool loop — up to 5 iterations]
-    LOOP --> CALL[llm_call_start/end]
-    CALL --> HASTOOL{tool_calls?}
-    HASTOOL -- no --> DONE
-    HASTOOL -- yes --> EXEC[Execute tools — mock in Phase 2]
-    EXEC --> RESULT[Append tool results → LOOP]
-    DONE[5 · turn_complete span] --> FIN[UPDATE runs<br/>status=completed · totals]
-```
+![Executor turn lifecycle: run_turn → router LLM → interrupt/handoff/slot-fill short-circuits → assemble system prompt → filter tools → tool loop (up to 5 iterations) → turn_complete span → update runs row](../assets/diagrams/executor-turn-lifecycle.excalidraw)
 
 ---
 

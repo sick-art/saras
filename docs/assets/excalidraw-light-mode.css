@@ -1,0 +1,21 @@
+excalidraw-renderer {
+  display: block;
+  background-color: #ffffff !important;
+  color-scheme: light;
+  border-radius: 6px;
+  padding: 8px;
+  margin: 1em 0;
+}
+
+excalidraw-renderer > div,
+excalidraw-renderer img {
+  background-color: #ffffff !important;
+}
+
+[data-md-color-scheme="slate"] excalidraw-renderer,
+[data-md-color-scheme="slate"] excalidraw-renderer > div,
+[data-md-color-scheme="slate"] excalidraw-renderer img {
+  background-color: #ffffff !important;
+  filter: none !important;
+  mix-blend-mode: normal !important;
+}

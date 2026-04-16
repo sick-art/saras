@@ -34,14 +34,7 @@ Saras is intentionally narrow: text-based conversational agents, end-to-end, own
 
 ## Lifecycle
 
-```mermaid
-flowchart LR
-    BUILD[Build<br/>YAML schema · Chat / Outline / Graph / Editor] --> SIM[Simulate<br/>WebSocket session · live span graph]
-    SIM --> DEPLOY[Deploy<br/>Docker Compose · executor]
-    DEPLOY --> OBS[Observe<br/>Runs · sessions · DuckDB analytics]
-    OBS --> EVAL[Evaluate<br/>Metric sets · LLM judge · review queue]
-    EVAL --> BUILD
-```
+![Saras lifecycle: Build → Simulate → Deploy → Observe → Evaluate, looping back to Build](assets/diagrams/lifecycle.excalidraw)
 
 | Phase | What happens |
 |-------|-------------|

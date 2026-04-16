@@ -49,14 +49,7 @@ The router model decides which sub-agent to invoke based on the condition/goal d
 
 ## Delegation Model
 
-```mermaid
-flowchart TD
-    U[User] --> ROOT[Root Agent · run_turn]
-    ROOT --> RTR[Router decision]
-    RTR -->|sub_agent=Billing Specialist| SUB[Sub-agent · run_turn<br/>parent_span_id=<root span>]
-    SUB -->|TurnResult| ROOT
-    ROOT -->|synthesised reply| U
-```
+![Delegation model: User sends a turn to the Root Agent, which runs the router and dispatches to a Sub-agent (with parent_span_id set to the root router span). The sub-agent returns a TurnResult, which the root synthesises into a reply back to the User.](../assets/diagrams/delegation-model.excalidraw)
 
 The root agent is responsible for:
 

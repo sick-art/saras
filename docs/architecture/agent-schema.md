@@ -18,22 +18,7 @@ Saras agents are defined entirely in YAML. The YAML is the single source of trut
 
 ## Hierarchy
 
-```mermaid
-flowchart TD
-    A[Agent<br/>name · version · models] --> P[persona · tone]
-    A --> GR[global_rules]
-    A --> IT[interrupt_triggers]
-    A --> OOS[out_of_scope]
-    A --> H[handoffs]
-    A --> T[tools<br/>LookupTool · KnowledgeTool · ActionTool]
-    A --> SUB[sub_agents]
-    A --> C[conditions]
-    C --> G[goals<br/>description · tone?]
-    G --> SL[slots<br/>ask_if_missing]
-    G --> SEQ[sequences<br/>ordered steps]
-    G --> RU[rules]
-    G --> TR[tool names<br/>string refs into agent.tools]
-```
+![Agent schema hierarchy: Agent root → persona/tone, global_rules, interrupt_triggers, out_of_scope, handoffs, tools, sub_agents, and conditions → goals → slots/sequences/rules/tools](../assets/diagrams/agent-hierarchy.excalidraw)
 
 ---
 

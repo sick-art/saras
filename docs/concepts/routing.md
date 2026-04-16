@@ -37,19 +37,7 @@ class RouterDecision(BaseModel):
 
 ### Priority order
 
-```mermaid
-flowchart TD
-    IN[User message] --> RT[Router model]
-    RT --> I{interrupt_triggered?}
-    I -- yes --> INT[type=interrupt<br/>Primary LLM with EMERGENCY OVERRIDE]
-    I -- no --> H{handoff_triggered?}
-    H -- yes --> HAN[type=handoff<br/>Canned transfer message]
-    H -- no --> S{unfilled_slots & active_goal?}
-    S -- yes --> SF[type=slot_fill<br/>Ask slot.ask_if_missing]
-    S -- no --> G{active_goal?}
-    G -- yes --> GO[type=response<br/>Tool loop for active goal]
-    G -- no --> FB[type=response<br/>Fallback — Layer 1 only]
-```
+![Routing priority: user message → router model → cascading checks (interrupt, handoff, unfilled slot, active goal) — each yes-branch returns a specific TurnResult type; otherwise fallback on Layer 1 only](../assets/diagrams/routing-priority.excalidraw)
 
 The executor enforces this priority explicitly — interrupts beat handoffs beat slot fill beat the tool loop.
 

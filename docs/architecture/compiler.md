@@ -15,19 +15,7 @@ The compiler is **pure and fast** — it never calls LLMs, never writes to the d
 
 ## Pipeline
 
-```mermaid
-flowchart LR
-    Y[YAML string<br/>agent.yaml_content] --> PY[yaml.safe_load]
-    PY --> VAL[AgentSchema.model_validate]
-    VAL --> BSP[_build_base_system_prompt<br/>persona + tone + global_rules + out_of_scope]
-    VAL --> TD[_build_tool_definitions<br/>snake_case + JSON Schema]
-    VAL --> RC[_build_routing_context<br/>NL conditions · triggers · handoffs]
-    VAL --> CL[_build_context_layers<br/>Layer 1..6 pre-built]
-    BSP --> CA[CompiledAgent]
-    TD --> CA
-    RC --> CA
-    CL --> CA
-```
+![Compiler pipeline: YAML string → yaml.safe_load → AgentSchema.model_validate → four parallel builders (base system prompt, tool definitions, routing context, context layers) → CompiledAgent](../assets/diagrams/compiler-pipeline.excalidraw)
 
 ---
 

@@ -6,47 +6,7 @@ Saras is a monorepo with two deployable packages — `backend/` (FastAPI + Pytho
 
 ## System Diagram
 
-```mermaid
-flowchart LR
-    subgraph Client["Browser"]
-        UI[React UI<br/>Chat · Form · Graph · YAML]
-        SIM[Simulator<br/>ConversationPane · LiveGraph]
-        OBS[Traces · Evals · Datasets]
-    end
-
-    subgraph Backend["FastAPI backend"]
-        BLD["/builder/chat (SSE)"]
-        WSS["/simulate (WebSocket)"]
-        REST["REST CRUD<br/>agents · projects · datasets · evals · traces"]
-        CORE[core: compiler · validator · executor]
-        PROV[providers: LiteLLM]
-        TRC[tracing: collector · query]
-        EVAL[evals: runner · judge · metrics]
-    end
-
-    subgraph Stores["Data stores"]
-        PG[(PostgreSQL 16<br/>primary store)]
-        RD[(Redis 7<br/>pub/sub + session)]
-        DK[(DuckDB<br/>analytics)]
-    end
-
-    UI --> BLD
-    UI --> REST
-    SIM --> WSS
-    OBS --> REST
-
-    BLD --> PROV
-    WSS --> CORE
-    REST --> CORE
-    CORE --> PROV
-    CORE --> PG
-    CORE --> RD
-    WSS --> RD
-    TRC --> PG
-    TRC --> DK
-    EVAL --> PG
-    EVAL --> PROV
-```
+![Saras system diagram: browser UIs call FastAPI backend endpoints, which drive the core (compiler/validator/executor), LiteLLM provider, tracing, and evals modules, backed by Postgres, Redis, and DuckDB](../assets/diagrams/system-diagram.excalidraw)
 
 ---
 
